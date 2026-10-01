@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NetWatch Light</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=particle-orb-1" />
+    <link rel="stylesheet" href="/assets/styles.css?v=topology-clean-up-1" />
   </head>
   <body class="presentation-mode is-home">
     <div class="presentation-shell" id="presentationShell">
@@ -31,9 +31,11 @@
 
       <section class="map-showcase" id="topologyShowcase" aria-label="Network topology map">
         <canvas class="particle-orb-canvas" id="particleOrbCanvas" aria-hidden="true"></canvas>
-        <div class="showcase-map-controls" aria-label="Map zoom controls">
+        <div class="showcase-map-controls" role="group" aria-label="Map controls">
           <button class="showcase-zoom-button" type="button" id="showcaseZoomIn" aria-label="Zoom in map">+</button>
           <button class="showcase-zoom-button" type="button" id="showcaseZoomOut" aria-label="Zoom out map">-</button>
+          <button class="showcase-zoom-button showcase-clean-up-button" type="button" id="showcaseCleanUp" title="Rearrange seeds and their endpoints" aria-controls="showcaseMap" disabled>clean up</button>
+          <span class="showcase-layout-status" id="showcaseLayoutStatus" role="status" aria-live="polite"></span>
         </div>
         <aside class="topology-evidence-panel" id="topologyEvidencePanel" aria-label="Topology evidence"></aside>
         <div class="showcase-map" id="showcaseMap">
@@ -203,6 +205,6 @@
     <span id="backendState" hidden>Connecting</span>
     <span id="eventStreamState" hidden>WebSocket pending</span>
 
-    <script src="/assets/app.js?v=particle-orb-1" type="module"></script>
+    <script src="/assets/app.js?v=topology-clean-up-1" type="module"></script>
   </body>
 </html>

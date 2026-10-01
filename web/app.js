@@ -1,11 +1,17 @@
 import { PresentationScroll, wheelPixels } from "./presentation-scroll.mjs";
 
+const TOPOLOGY_LAYOUT_VERSION = "organic-seed-zones-v7";
+const TOPOLOGY_MIN_ZOOM = 0.03;
+
 const appState = {
   selectedView: "home",
   selectedDeviceId: "core-01",
   autoPollTimer: null,
   topologyPositions: {},
   topologyLayoutSignature: "",
+  topologyStructure: null,
+  topologyCleaning: false,
+  topologyLayoutMigrationPending: window.localStorage?.getItem("netwatch.topologyLayoutVersion") !== TOPOLOGY_LAYOUT_VERSION,
   topologyLogicalSize: { width: 1, height: 1 },
   topologyZoom: 1,
   topologyZoomUserSet: false,
@@ -521,8 +527,9 @@ function isSavedMapLayout(layout) {
   return layout?.source === "saved-map" && Number.isFinite(Number(layout.x)) && Number.isFinite(Number(layout.y));
 }
 
-function applySavedTopologyLayouts(positions, devices) {
+function applySavedTopologyLayouts(positions, devices, ignoredDeviceIds = new Set()) {
   devices.forEach((device) => {
+    if (ignoredDeviceIds.has(device.id)) return;
     if (!isSavedMapLayout(device.layout)) return;
     positions[device.id] = {
       x: Number(device.layout.x),
@@ -532,25 +539,39 @@ function applySavedTopologyLayouts(positions, devices) {
 }
 
 let topologyLayoutSaveTimer = null;
+let topologyLayoutSaveQueue = Promise.resolve();
+
+async function saveTopologyLayout() {
+  window.clearTimeout(topologyLayoutSaveTimer);
+  const layouts = {};
+  getDevices().forEach((device) => {
+    const position = appState.topologyPositions[device.id];
+    if (!position) return;
+    layouts[device.id] = {
+      x: Math.round(position.x * 10) / 10,
+      y: Math.round(position.y * 10) / 10,
+      locked: Boolean(device.layout?.locked)
+    };
+    device.layout = { ...layouts[device.id], source: "saved-map" };
+  });
+  if (Object.keys(layouts).length === 0) return;
+  // A pending drag save must finish before a newer clean-up layout is written.
+  topologyLayoutSaveQueue = topologyLayoutSaveQueue.catch(() => {}).then(() =>
+    apiPostJson("/api/topology/layout", { layouts })
+  );
+  const result = await topologyLayoutSaveQueue;
+  if (result.snapshot) appState.snapshot = result.snapshot;
+  if (appState.topologyLayoutMigrationPending) {
+    window.localStorage?.setItem("netwatch.topologyLayoutVersion", TOPOLOGY_LAYOUT_VERSION);
+    appState.topologyLayoutMigrationPending = false;
+  }
+}
 
 function saveTopologyLayoutSoon() {
   window.clearTimeout(topologyLayoutSaveTimer);
   topologyLayoutSaveTimer = window.setTimeout(async () => {
-    const layouts = {};
-    getDevices().forEach((device) => {
-      const position = appState.topologyPositions[device.id];
-      if (!position) return;
-      layouts[device.id] = {
-        x: Math.round(position.x * 10) / 10,
-        y: Math.round(position.y * 10) / 10,
-        locked: Boolean(device.layout?.locked)
-      };
-      device.layout = { ...layouts[device.id], source: "saved-map" };
-    });
-    if (Object.keys(layouts).length === 0) return;
     try {
-      const result = await apiPostJson("/api/topology/layout", { layouts });
-      if (result.snapshot) appState.snapshot = result.snapshot;
+      await saveTopologyLayout();
     } catch (error) {
       console.warn("Topology layout save failed", error);
     }
@@ -1881,10 +1902,17 @@ function compareTopologyDeviceIds(deviceMap) {
   return (a, b) => topologyDeviceLabel(deviceMap, a).localeCompare(topologyDeviceLabel(deviceMap, b));
 }
 
-function getTopologySignature(devices, links) {
-  const layoutVersion = "diagram-v2-stable-nodes";
-  const nodePart = devices.map((device) => device.id).sort().join("|");
-  return `${layoutVersion}::${nodePart}`;
+function getTopologySignature(devices, structure) {
+  const layoutVersion = "diagram-v3-seed-zones";
+  const nodePart = devices
+    .map((device) => `${device.id}:${structure.roleById.get(device.id) || "unknown"}`)
+    .sort()
+    .join("|");
+  const parentPart = [...structure.parentByChild.entries()]
+    .map(([childId, parentId]) => `${childId}>${parentId}`)
+    .sort()
+    .join("|");
+  return `${layoutVersion}::${nodePart}::${parentPart}::${structure.linkPairs.join("|")}`;
 }
 
 function getValidTopologyLinks(devices, links) {
@@ -2077,7 +2105,7 @@ function isTopologySegment(device) {
 }
 
 function isTopologyPeripheral(device) {
-  return isTopologyEndpoint(device) || isTopologySegment(device);
+  return isTopologyEndpoint(device) || isTopologySegment(device) || device?.status === "pending";
 }
 
 function getTopologyParentMap(devices, links, deviceMap) {
@@ -2107,6 +2135,58 @@ function getTopologyParentMap(devices, links, deviceMap) {
   });
 
   return { parentByChild, childrenByParent };
+}
+
+function topologyLayoutRole(device) {
+  if (isTopologyPeripheral(device)) return "peripheral";
+  return device?.status === "pending" ? "candidate" : "seed";
+}
+
+function getTopologyStructure(devices, links) {
+  const deviceMap = new Map(devices.map((device) => [device.id, device]));
+  const { parentByChild, childrenByParent } = getTopologyParentMap(devices, links, deviceMap);
+  const roleById = new Map(devices.map((device) => [device.id, topologyLayoutRole(device)]));
+  const linkPairs = getValidTopologyLinks(devices, links)
+    .map((link) => [link.from, link.to].sort().join("~"))
+    .sort();
+  return { roleById, parentByChild, childrenByParent, linkPairs };
+}
+
+function getAffectedTopologyLayoutIds(previous, current) {
+  if (!previous) return new Set();
+  const affected = new Set();
+  const affectedParents = new Set();
+
+  current.roleById.forEach((role, id) => {
+    const previousRole = previous.roleById.get(id);
+    const parentId = current.parentByChild.get(id);
+    const previousParentId = previous.parentByChild.get(id);
+
+    if (!previousRole || previousRole !== role) {
+      affected.add(id);
+      if (role === "seed") affectedParents.add(id);
+    }
+    if (parentId !== previousParentId) {
+      affected.add(id);
+      if (parentId) affectedParents.add(parentId);
+      if (previousParentId) affectedParents.add(previousParentId);
+    }
+  });
+
+  previous.roleById.forEach((_, id) => {
+    if (current.roleById.has(id)) return;
+    const previousParentId = previous.parentByChild.get(id);
+    if (previousParentId) affectedParents.add(previousParentId);
+  });
+
+  affectedParents.forEach((parentId) => {
+    (current.childrenByParent.get(parentId) || []).forEach((id) => affected.add(id));
+    (previous.childrenByParent.get(parentId) || []).forEach((id) => {
+      if (current.roleById.has(id)) affected.add(id);
+    });
+  });
+
+  return affected;
 }
 
 function getRenderableTopologyLinks(devices, links) {
@@ -2143,10 +2223,10 @@ function getCoreTopologyLevels(coreIds, links, deviceMap) {
 }
 
 function getTopologyRootId(coreIds, adjacency, deviceMap) {
-  const sternpunkt = coreIds.find((id) => {
-    const device = deviceMap.get(id);
-    return `${device?.name || ""} ${device?.ip || ""}`.toLowerCase().includes("sternpunkt");
-  });
+  const sternpunkt = coreIds
+    .filter((id) => `${deviceMap.get(id)?.name || ""} ${deviceMap.get(id)?.ip || ""}`.toLowerCase().includes("sternpunkt"))
+    .map((id) => ({ id, degree: adjacency.get(id)?.size || 0 }))
+    .sort((a, b) => b.degree - a.degree || compareTopologyDeviceIds(deviceMap)(a.id, b.id))[0]?.id;
   if (sternpunkt) return sternpunkt;
   return coreIds
     .map((id) => ({ id, degree: adjacency.get(id)?.size || 0 }))
@@ -2249,13 +2329,13 @@ function placeEndpointZone(children, parentId, rootId, positions, options) {
     { x: 0, y: 1 }
   );
   const baseAngle = Math.atan2(away.y, away.x);
-  const maxPerRing = 5;
+  const maxPerRing = 8;
   for (let offset = 0; offset < ordered.length; offset += maxPerRing) {
     const ring = Math.floor(offset / maxPerRing);
     const group = ordered.slice(offset, offset + maxPerRing);
-    const spread = Math.min(Math.PI * 0.78, endpointSpread + group.length * 0.075);
+    const spread = Math.min(Math.PI * 1.48, endpointSpread + group.length * 0.09);
     const step = group.length > 1 ? spread / (group.length - 1) : 0;
-    const radius = endpointRadius + ring * (cardHeight * 1.02);
+    const radius = endpointRadius + ring * (cardHeight * 0.9);
     group.forEach((id, index) => {
       const angle = baseAngle - spread / 2 + step * index;
       positions[id] = {
@@ -2271,42 +2351,10 @@ function getTopologyLayoutNodeSize(id, deviceMap, cardWidth, cardHeight) {
   if (isTopologyEndpoint(device)) {
     return { width: cardWidth * 0.78, height: cardHeight * 0.62 };
   }
-  return { width: cardWidth, height: cardHeight };
-}
-
-function resolveTopologyPositionOverlaps(positions, ids, deviceMap, cardWidth, cardHeight, gap = 34) {
-  const sortedIds = [...ids].filter((id) => positions[id]);
-  for (let pass = 0; pass < sortedIds.length; pass += 1) {
-    let changed = false;
-    sortedIds.sort((a, b) => positions[a].y - positions[b].y || positions[a].x - positions[b].x);
-    for (let i = 0; i < sortedIds.length; i += 1) {
-      for (let j = i + 1; j < sortedIds.length; j += 1) {
-        const aId = sortedIds[i];
-        const bId = sortedIds[j];
-        const a = positions[sortedIds[i]];
-        const b = positions[sortedIds[j]];
-        const aDevice = deviceMap.get(aId);
-        const bDevice = deviceMap.get(bId);
-        const aEndpoint = isTopologyEndpoint(aDevice);
-        const bEndpoint = isTopologyEndpoint(bDevice);
-        const aSize = getTopologyLayoutNodeSize(aId, deviceMap, cardWidth, cardHeight);
-        const bSize = getTopologyLayoutNodeSize(bId, deviceMap, cardWidth, cardHeight);
-        const xOverlap = Math.min(a.x + aSize.width, b.x + bSize.width) - Math.max(a.x, b.x);
-        const yOverlap = Math.min(a.y + aSize.height, b.y + bSize.height) - Math.max(a.y, b.y);
-        if (xOverlap <= -gap || yOverlap <= -gap) continue;
-        if (aEndpoint && !bEndpoint) {
-          const aCenterY = a.y + aSize.height / 2;
-          const bCenterY = b.y + bSize.height / 2;
-          a.y = aCenterY <= bCenterY ? b.y - aSize.height - gap : b.y + bSize.height + gap;
-          changed = true;
-          continue;
-        }
-        b.y = a.y + aSize.height + gap;
-        changed = true;
-      }
-    }
-    if (!changed) break;
+  if (isTopologySegment(device) || device?.status === "pending") {
+    return { width: cardWidth * 0.86, height: cardHeight * 0.62 };
   }
+  return { width: cardWidth, height: cardHeight };
 }
 
 function getTopologyBounds(positions, ids, deviceMap, cardWidth, cardHeight) {
@@ -2325,21 +2373,19 @@ function getTopologyBounds(positions, ids, deviceMap, cardWidth, cardHeight) {
   );
 }
 
-function computeShowcaseTopologyLayout(devices, links, width, height, cardWidth, cardHeight) {
+function computeShowcaseTopologyLayout(devices, links, width, height, cardWidth, cardHeight, options = {}) {
   const deviceMap = new Map(devices.map((device) => [device.id, device]));
   const validLinks = getValidTopologyLinks(devices, links);
+  const ignoredSavedLayoutIds = options.ignoredSavedLayoutIds || new Set();
   const margin = 240;
-  const coreRadius = clamp(Math.min(width, height) * 0.76, 560, 900);
-  const treeStepX = clamp(cardWidth + 330, 600, 740);
-  const treeStepY = clamp(cardHeight + 190, 520, 680);
-  const endpointRadius = clamp(cardWidth + 220, 440, 560);
-  const endpointSpread = Math.PI * 0.52;
-  const logicalWidthBase = Math.max(width * 2.15, coreRadius * 2 + endpointRadius * 2 + cardWidth + margin * 2);
-  const logicalHeightBase = Math.max(height * 2.05, coreRadius * 2 + endpointRadius * 2 + cardHeight + margin * 2);
-  const rootCenter = { x: logicalWidthBase / 2, y: logicalHeightBase / 2 };
+  const baseCoreRadius = clamp(Math.min(width, height) * 1.25, 900, 1260);
+  const endpointRadius = clamp(cardWidth + 180, 400, 470);
+  const endpointSpread = Math.PI * 1.08;
   const positions = {};
 
   if (validLinks.length === 0) {
+    const logicalWidthBase = Math.max(width * 2.15, baseCoreRadius * 2 + endpointRadius * 2 + cardWidth + margin * 2);
+    const logicalHeightBase = Math.max(height * 2.05, baseCoreRadius * 2 + endpointRadius * 2 + cardHeight + margin * 2);
     const sortedIds = devices.map((device) => device.id).sort(compareTopologyDeviceIds(deviceMap));
     const grid = layoutTopologyGrid(sortedIds, endpointRadius, cardHeight + 74, Math.max(2, Math.ceil(Math.sqrt(sortedIds.length))), cardWidth, cardHeight);
     grid.items.forEach((item) => {
@@ -2353,7 +2399,7 @@ function computeShowcaseTopologyLayout(devices, links, width, height, cardWidth,
   }
 
   const { parentByChild, childrenByParent } = getTopologyParentMap(devices, links, deviceMap);
-  const coreDevices = devices.filter((device) => !isTopologyEndpoint(device));
+  const coreDevices = devices.filter((device) => !isTopologyPeripheral(device));
   const peripheralWithoutParent = devices.filter((device) => isTopologyPeripheral(device) && !parentByChild.has(device.id));
   const coreIds = coreDevices.map((device) => device.id).sort(compareTopologyDeviceIds(deviceMap));
   const coreAdjacency = buildTopologyAdjacency(coreDevices, validLinks.filter((link) => {
@@ -2363,9 +2409,22 @@ function computeShowcaseTopologyLayout(devices, links, width, height, cardWidth,
   }));
 
   const rootId = getTopologyRootId(coreIds, coreAdjacency, deviceMap);
-  positions[rootId] = { x: rootCenter.x - cardWidth / 2, y: rootCenter.y - cardHeight / 2 };
   const { parentByCore, levels } = getCoreTree(rootId, coreIds, validLinks, deviceMap);
   const firstLevel = (levels[1] || []).sort(compareTopologyDeviceIds(deviceMap));
+  const largestSatelliteGroup = Math.max(1, ...[...childrenByParent.values()].map((children) => new Set(children).size));
+  const satelliteRings = Math.max(1, Math.ceil(largestSatelliteGroup / 8));
+  const outerSatelliteRadius = endpointRadius + (satelliteRings - 1) * cardHeight * 0.9;
+  const desiredZoneSpacing = outerSatelliteRadius * 2 + cardWidth * 0.86;
+  const radialSpacing = firstLevel.length > 1
+    ? desiredZoneSpacing / (2 * Math.sin(Math.PI / firstLevel.length))
+    : baseCoreRadius;
+  const coreRadius = Math.max(baseCoreRadius, radialSpacing);
+  const treeStepX = Math.max(clamp(cardWidth + 640, 860, 1040), desiredZoneSpacing);
+  const treeStepY = Math.max(clamp(cardHeight + 500, 760, 980), desiredZoneSpacing);
+  const logicalWidthBase = Math.max(width * 2.15, coreRadius * 2 + endpointRadius * 2 + cardWidth + margin * 2);
+  const logicalHeightBase = Math.max(height * 2.05, coreRadius * 2 + endpointRadius * 2 + cardHeight + margin * 2);
+  const rootCenter = { x: logicalWidthBase / 2, y: logicalHeightBase / 2 };
+  positions[rootId] = { x: rootCenter.x - cardWidth / 2, y: rootCenter.y - cardHeight / 2 };
   const zoneByCore = new Map([[rootId, { x: 0, y: 0 }]]);
 
   firstLevel.forEach((id, index) => {
@@ -2440,8 +2499,7 @@ function computeShowcaseTopologyLayout(devices, links, width, height, cardWidth,
   }
 
   const allPositionedIds = devices.map((device) => device.id).filter((id) => positions[id]);
-  resolveTopologyPositionOverlaps(positions, allPositionedIds, deviceMap, cardWidth, cardHeight);
-  applySavedTopologyLayouts(positions, devices);
+  applySavedTopologyLayouts(positions, devices, ignoredSavedLayoutIds);
   const bounds = getTopologyBounds(positions, allPositionedIds, deviceMap, cardWidth, cardHeight);
   if (bounds.minX < margin) {
     const shift = margin - bounds.minX;
@@ -2470,15 +2528,17 @@ function computeShowcaseTopologyLayout(devices, links, width, height, cardWidth,
 
 function fitShowcaseZoom(logicalWidth, logicalHeight, stageWidth, stageHeight) {
   const fit = Math.min(1, (stageWidth - 8) / Math.max(1, logicalWidth), (stageHeight - 8) / Math.max(1, logicalHeight));
-  return clamp(fit, 0.44, 1);
+  return clamp(fit, TOPOLOGY_MIN_ZOOM, 1);
 }
 
 function updateShowcaseZoomControls() {
+  const cleanUp = document.getElementById("showcaseCleanUp");
+  if (cleanUp) cleanUp.disabled = appState.topologyCleaning || getDevices().length === 0;
   const zoomIn = document.getElementById("showcaseZoomIn");
   const zoomOut = document.getElementById("showcaseZoomOut");
   if (!zoomIn || !zoomOut) return;
   zoomIn.disabled = appState.topologyZoom >= 1.75;
-  zoomOut.disabled = appState.topologyZoom <= 0.28;
+  zoomOut.disabled = appState.topologyZoom <= TOPOLOGY_MIN_ZOOM;
 }
 
 function clampShowcasePan(pan = appState.topologyPan) {
@@ -2529,7 +2589,7 @@ function applyShowcaseZoom() {
 }
 
 function setShowcaseZoom(value, userSet = true) {
-  appState.topologyZoom = clamp(value, 0.28, 1.75);
+  appState.topologyZoom = clamp(value, TOPOLOGY_MIN_ZOOM, 1.75);
   if (userSet) appState.topologyZoomUserSet = true;
   applyShowcaseZoom();
 }
@@ -2845,7 +2905,29 @@ function bindShowcasePan() {
   });
 }
 
-function renderShowcaseTopology() {
+async function cleanUpShowcaseTopology() {
+  if (appState.topologyCleaning || getDevices().length === 0) return;
+  const button = document.getElementById("showcaseCleanUp");
+  const status = document.getElementById("showcaseLayoutStatus");
+  appState.topologyCleaning = true;
+  button?.setAttribute("aria-busy", "true");
+  updateShowcaseZoomControls();
+  if (status) status.textContent = "Saving layout...";
+  try {
+    renderShowcaseTopology({ resetLayout: true });
+    await saveTopologyLayout();
+    if (status) status.textContent = "Layout saved";
+  } catch (error) {
+    if (status) status.textContent = "Layout not saved. Try again.";
+    console.warn("Topology clean up failed", error);
+  } finally {
+    appState.topologyCleaning = false;
+    button?.removeAttribute("aria-busy");
+    updateShowcaseZoomControls();
+  }
+}
+
+function renderShowcaseTopology({ resetLayout = false } = {}) {
   const stage = document.getElementById("showcaseMap");
   const plane = document.getElementById("showcaseMapPlane");
   const nodes = document.getElementById("showcaseNodeLayer");
@@ -2859,7 +2941,16 @@ function renderShowcaseTopology() {
   const cardHeight = 260;
   const devices = getDevices();
   const links = appState.snapshot.links || [];
-  const signature = getTopologySignature(devices, getValidTopologyLinks(devices, links));
+  const structure = getTopologyStructure(devices, links);
+  const signature = getTopologySignature(devices, structure);
+  const structureChanged = signature !== appState.topologyLayoutSignature;
+  const affectedLayoutIds = structureChanged
+    ? getAffectedTopologyLayoutIds(appState.topologyStructure, structure)
+    : new Set();
+  const migrationLayoutIds = appState.topologyLayoutMigrationPending || resetLayout
+    ? new Set(devices.map((device) => device.id))
+    : new Set();
+  const ignoredSavedLayoutIds = new Set([...affectedLayoutIds, ...migrationLayoutIds]);
   let shouldCenterOnFocus = false;
 
   if (devices.length === 0) {
@@ -2868,6 +2959,7 @@ function renderShowcaseTopology() {
     plane.style.height = "100%";
     appState.topologyLogicalSize = { width: Math.max(1, width), height: Math.max(1, height) };
     appState.topologyLayoutSignature = signature;
+    appState.topologyStructure = structure;
     appState.topologyPositions = {};
     appState.topologyZoomUserSet = false;
     appState.topologyPan = { x: 0, y: 0 };
@@ -2882,16 +2974,21 @@ function renderShowcaseTopology() {
     return;
   }
 
-  const layout = computeShowcaseTopologyLayout(devices, links, width, height, cardWidth, cardHeight);
-  if (signature !== appState.topologyLayoutSignature) {
+  const layout = computeShowcaseTopologyLayout(devices, links, width, height, cardWidth, cardHeight, {
+    ignoredSavedLayoutIds
+  });
+  const hadLayout = Boolean(appState.topologyLayoutSignature);
+  if (structureChanged || resetLayout) {
     const previousPositions = appState.topologyPositions || {};
-    const hadLayout = Boolean(appState.topologyLayoutSignature);
     appState.topologyPositions = devices.reduce((positions, device) => {
-      positions[device.id] = previousPositions[device.id] || layout.positions[device.id];
+      positions[device.id] = resetLayout || affectedLayoutIds.has(device.id)
+        ? layout.positions[device.id]
+        : previousPositions[device.id] || layout.positions[device.id];
       return positions;
     }, {});
     appState.topologyLayoutSignature = signature;
-    if (!hadLayout) {
+    appState.topologyStructure = structure;
+    if (!hadLayout || resetLayout) {
       appState.topologyZoomUserSet = false;
       appState.topologyPan = { x: 0, y: 0 };
       shouldCenterOnFocus = true;
@@ -2909,7 +3006,7 @@ function renderShowcaseTopology() {
   nodes.style.height = `${layout.height}px`;
   if (!appState.topologyZoomUserSet) {
     setShowcaseZoom(fitShowcaseZoom(layout.width, layout.height, width, height), false);
-    if (shouldCenterOnFocus) centerShowcaseOn(layout.focus);
+    if (shouldCenterOnFocus) centerShowcaseOn({ x: layout.width / 2, y: layout.height / 2 });
   } else {
     applyShowcaseZoom();
   }
@@ -2960,6 +3057,9 @@ function renderShowcaseTopology() {
   bindShowcaseDrag();
   bindShowcasePan();
   requestAnimationFrame(renderShowcaseLinks);
+  if (!resetLayout && ((hadLayout && affectedLayoutIds.size > 0) || appState.topologyLayoutMigrationPending)) {
+    saveTopologyLayoutSoon();
+  }
 }
 
 function startParticleOrb() {
@@ -3416,6 +3516,7 @@ function bindEvents() {
   document.getElementById("presentationRunPoll")?.addEventListener("click", toggleBackendPoll);
   document.getElementById("showcaseZoomIn")?.addEventListener("click", () => setShowcaseZoom(getAppliedShowcaseZoom() + 0.14));
   document.getElementById("showcaseZoomOut")?.addEventListener("click", () => setShowcaseZoom(getAppliedShowcaseZoom() - 0.14));
+  document.getElementById("showcaseCleanUp")?.addEventListener("click", cleanUpShowcaseTopology);
   document.getElementById("devicePrevButton")?.addEventListener("click", () => setSelectedDeviceIndex(appState.selectedDeviceIndex - 1));
   document.getElementById("deviceNextButton")?.addEventListener("click", () => setSelectedDeviceIndex(appState.selectedDeviceIndex + 1));
   document.querySelectorAll("[data-monitor-view]").forEach((button) => {
