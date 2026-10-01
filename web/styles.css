@@ -65,6 +65,7 @@ body:not(.presentation-mode) .presentation-shell {
   --code-width: clamp(190px, 12.1vw, 250px);
   --code-fill-width: clamp(96px, 8vw, 180px);
   --map-code-reserve: calc(var(--code-width) + var(--code-fill-width) + 22px);
+  --map-safe-top: calc(clamp(12px, 1.3vh, 22px) + 104px);
   position: relative;
   min-height: calc(400vh + 33.333vh);
   color: #070607;
@@ -338,14 +339,13 @@ body:not(.presentation-mode) .presentation-shell {
 
 .showcase-map {
   position: absolute;
-  inset: 0;
-  right: var(--map-code-reserve);
+  inset: var(--map-safe-top) var(--map-code-reserve) 0 0;
   z-index: 1;
   --topology-zoom: 1;
   --topology-pan-x: 0px;
   --topology-pan-y: 0px;
   width: auto;
-  height: 100%;
+  height: auto;
   overflow: hidden;
   opacity: 0;
   transform: translate3d(-150px, 0, 0);
@@ -2731,6 +2731,10 @@ tr.clickable-row:hover {
 }
 
 @media (max-width: 980px) {
+  .presentation-shell {
+    --map-safe-top: calc(clamp(12px, 1.3vh, 22px) + 88px);
+  }
+
   .showcase-map-controls {
     top: calc(clamp(12px, 1.3vh, 22px) + 15px);
   }
