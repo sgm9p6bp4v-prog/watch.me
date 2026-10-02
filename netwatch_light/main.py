@@ -17,6 +17,7 @@ from .polling import (
     seed_key,
     seed_metadata,
 )
+from .smc import SmcSourceConfig, discover_smc
 from .snmp_live import SnmpSeedConfig, discover_seed
 from .state import NetWatchState
 from .storage import default_database_url
@@ -44,6 +45,12 @@ class SnmpSeedRequest(BaseModel):
     priv_key: str = ""
     auth_protocol: str = "SHA"
     priv_protocol: str = "AES"
+
+
+class SmcSourceRequest(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(default=80, ge=1, le=65535)
+    scheme: str = Field(default="http", pattern="^(http|https)$")
 
 
 class PollingRequest(BaseModel):
@@ -121,6 +128,7 @@ async def snapshot(response: Response) -> dict[str, Any]:
     data["runtime"] = {
         "seed_credentials_loaded": len(seed_configs),
         "seed_credentials_saved": len(state.seed_credentials),
+        "smc_sources_saved": len(state.smc_sources),
         "storage_backend": state.storage_backend,
         "external_poller_alive": state.is_external_poller_alive(),
         "last_poll_run": state.poll_runs[0] if state.poll_runs else None,
@@ -257,6 +265,32 @@ async def add_live_seed(seed: SnmpSeedRequest) -> dict[str, Any]:
     return {
         "seed": state.seeds,
         "system": discovery["system"],
+        "counts": discovery["counts"],
+        "snapshot": result["snapshot"],
+        "event": result["event"],
+    }
+
+
+@app.post("/api/live/smc")
+async def add_smc_source(source: SmcSourceRequest) -> dict[str, Any]:
+    state.reload()
+    try:
+        config = SmcSourceConfig(
+            host=source.host.strip(),
+            port=source.port,
+            scheme=source.scheme,
+        )
+        discovery = await discover_smc(config)
+    except Exception as exc:
+        event = state.add_event(f"SMC host failed for {source.host}: {exc}")
+        await publish({"type": "live.smc.failed", "event": event})
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    state.register_smc_source(discovery["source"])
+    result = state.import_smc_discovery(discovery, config.key)
+    await publish({"type": "live.smc.imported", "event": result["event"]})
+    return {
+        "source": discovery["source"],
+        "machine": discovery["machine"],
         "counts": discovery["counts"],
         "snapshot": result["snapshot"],
         "event": result["event"],

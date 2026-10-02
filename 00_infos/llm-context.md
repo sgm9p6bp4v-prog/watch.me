@@ -3,8 +3,8 @@
 ## Zweck
 
 NetWatch Light ist der lauffaehige, bewusst begrenzte MVP fuer einen lokalen
-SNMP-Netzwerkmonitor. Er visualisiert Inventar, Interface-Zustaende,
-LLDP-Topologie, Alerts und Events. `TECHNICAL_AUDIT.md` beschreibt die spaetere
+Netzwerkmonitor. Er visualisiert SNMP- und Disguise-SMC-Inventar,
+Interface-Zustaende, LLDP-Topologie, Alerts und Events. `TECHNICAL_AUDIT.md` beschreibt die spaetere
 Zielarchitektur; es ist nicht die Beschreibung des heutigen Runtime-Standes.
 
 ## Architektur
@@ -16,14 +16,16 @@ Browser UI in web/
   -> REST /api/* und WebSocket /ws/events
   -> netwatch_light.main
   -> NetWatchState
-  -> data/netwatch_state.json
-  -> optionaler Live-SNMP-Adapter netwatch_light.snmp_live
+  -> SQLAlchemy/SQLite plus JSON-Kompatibilitaetssnapshot
+  -> separater Poller-Prozess netwatch_light.poller
+  -> Live-SNMP-Adapter netwatch_light.snmp_live
+  -> Read-only-Disguise-SMC-Adapter netwatch_light.smc
 ```
 
-Mock-Inventar und echte SNMP-Seeds teilen denselben State. Polling laeuft im
-Light-Build als Task im FastAPI-Prozess. Redis/arq, PostgreSQL/TimescaleDB,
-Alembic und verschluesselte Credential-Ablage gehoeren zur Zielarchitektur und
-sind noch nicht implementiert.
+Mock-Inventar, echte SNMP-Seeds und SMC-Chassis teilen denselben State. Der
+separate Poller liest beide gespeicherten Quelltypen. SMC-NICs werden per MAC
+mit LLDP-Kandidaten zusammengefuehrt; die Verkehrszaehler stammen weiterhin von
+der passenden Switch-Port-Schnittstelle.
 
 ## Setup
 
@@ -41,10 +43,8 @@ UI: `http://127.0.0.1:5173/`.
 ## Betrieb
 
 Der Light-Build ist nur fuer lokale/LAN-Tests vorgesehen und besitzt keinen
-Produktiv-Deploy. Runtime-State liegt in `data/netwatch_state.json` und ist von
-Git ausgeschlossen. Im aktuellen Test-Build werden SNMP-Communities und
-SNMPv3-Secrets dort im Klartext gespeichert; deshalb Datei nicht teilen,
-committen oder auf einem oeffentlichen Host betreiben.
+Produktiv-Deploy. Runtime-State liegt standardmaessig in `data/netwatch.db` und
+ist von Git ausgeschlossen. SNMP-Zugangsdaten werden verschluesselt gespeichert.
 
 Runbook: [`00_infos/runbooks/local-light-app.md`](runbooks/local-light-app.md).
 
@@ -52,11 +52,12 @@ Runbook: [`00_infos/runbooks/local-light-app.md`](runbooks/local-light-app.md).
 
 - `GET /api/health` und `GET /api/snapshot`
 - `POST /api/poll`, `/api/discovery`, `/api/polling`
-- `POST /api/live/seed`, `/api/live/clear`
+- `POST /api/live/seed`, `/api/live/smc`, `/api/live/clear`
 - `POST /api/topology/layout`
 - Alert-Aktionen unter `/api/alerts/{id}/ack|resolve`
 - WebSocket `/ws/events`
 - SNMP v2c/v3 gegen explizit konfigurierte Seed-Hosts; kein Subnet-Scan
+- Disguise SMC API read-only gegen explizit konfigurierte Hosts
 
 ## Abhaengigkeiten und Grenzen
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NetWatch Light</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=topology-nav-safe-area-1" />
+    <link rel="stylesheet" href="/assets/styles.css?v=smc-integration-1" />
   </head>
   <body class="presentation-mode is-home">
     <div class="presentation-shell" id="presentationShell">
@@ -57,6 +57,9 @@
           </button>
           <button class="dashboard-action-button dashboard-seed-button" id="presentationSetupButton" type="button">
             <span>SNMP Seed</span>
+          </button>
+          <button class="dashboard-action-button dashboard-smc-button" id="presentationSmcButton" type="button">
+            <span>SMC Host</span>
           </button>
           <button class="dashboard-action-button dashboard-clear-button" id="presentationClearAllButton" type="button">
             <span>Clear All</span>
@@ -130,8 +133,8 @@
         <section class="live-setup-card" role="dialog" aria-modal="true" aria-labelledby="liveSetupTitle">
           <header class="live-setup-head">
             <div>
-              <span>Live Seed Discovery</span>
-              <h2 id="liveSetupTitle">Connect FS switch</h2>
+              <span>Managed Source Discovery</span>
+              <h2 id="liveSetupTitle">Connect network source</h2>
             </div>
             <button class="live-setup-close" id="liveSetupClose" type="button" aria-label="Close setup">×</button>
           </header>
@@ -198,6 +201,32 @@
             </div>
           </form>
           <p class="seed-result" id="presentationSeedResult">No live seed imported in this browser session.</p>
+
+          <form class="seed-form presentation-smc-form" id="presentationSmcForm">
+            <div class="source-form-heading">
+              <span>Disguise SMC</span>
+              <strong>Import one chassis and reconcile its NICs by MAC address.</strong>
+            </div>
+            <label>
+              <span>SMC host</span>
+              <input id="presentationSmcHost" name="host" type="text" placeholder="192.168.0.156" autocomplete="off" required />
+            </label>
+            <label>
+              <span>Port</span>
+              <input id="presentationSmcPort" name="port" type="number" min="1" max="65535" value="80" required />
+            </label>
+            <label>
+              <span>Protocol</span>
+              <select id="presentationSmcScheme" name="scheme">
+                <option value="http">HTTP</option>
+                <option value="https">HTTPS</option>
+              </select>
+            </label>
+            <div class="seed-actions">
+              <button class="primary-button" type="submit" id="presentationSmcSubmitButton">Test and import SMC</button>
+            </div>
+          </form>
+          <p class="seed-result" id="presentationSmcResult">No SMC host imported in this browser session.</p>
         </section>
       </div>
     </div>
@@ -205,6 +234,6 @@
     <span id="backendState" hidden>Connecting</span>
     <span id="eventStreamState" hidden>WebSocket pending</span>
 
-    <script src="/assets/app.js?v=topology-clean-up-1" type="module"></script>
+    <script src="/assets/app.js?v=smc-integration-1" type="module"></script>
   </body>
 </html>

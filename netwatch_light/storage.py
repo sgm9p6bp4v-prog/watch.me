@@ -114,6 +114,21 @@ seeds = Table(
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
+smc_sources = Table(
+    "smc_sources",
+    metadata,
+    Column("key", String(260), primary_key=True),
+    Column("host", String(255), nullable=False, index=True),
+    Column("port", Integer, nullable=False, default=80),
+    Column("scheme", String(20), nullable=False, default="http"),
+    Column("hostname", String(255), nullable=False, default=""),
+    Column("serial", String(120), nullable=False, default=""),
+    Column("status", String(40), nullable=False, index=True),
+    Column("last_error", Text, nullable=False, default=""),
+    Column("payload", JSON, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
 seed_credentials = Table(
     "seed_credentials",
     metadata,
@@ -291,6 +306,7 @@ class DatabaseStore:
             events,
             alerts,
             seed_credentials,
+            smc_sources,
             seeds,
             topology_evidence,
             links,
@@ -422,6 +438,27 @@ class DatabaseStore:
             )
         if seed_rows:
             conn.execute(seeds.insert(), seed_rows)
+
+        smc_source_rows = []
+        for source in payload.get("smc_sources", []):
+            if not isinstance(source, dict) or not source.get("key"):
+                continue
+            smc_source_rows.append(
+                {
+                    "key": str(source["key"]),
+                    "host": str(source.get("host") or ""),
+                    "port": int(source.get("port") or 80),
+                    "scheme": str(source.get("scheme") or "http"),
+                    "hostname": str(source.get("hostname") or ""),
+                    "serial": str(source.get("serial") or ""),
+                    "status": str(source.get("status") or "unknown"),
+                    "last_error": str(source.get("last_error") or ""),
+                    "payload": source,
+                    "updated_at": now,
+                }
+            )
+        if smc_source_rows:
+            conn.execute(smc_sources.insert(), smc_source_rows)
 
         credential_rows = []
         for credential in payload.get("seed_credentials", []):

@@ -506,11 +506,17 @@ body:not(.presentation-mode) .presentation-shell {
   user-select: none;
 }
 
-.showcase-node.is-endpoint {
+.showcase-node.is-endpoint,
+.showcase-node.is-media-server {
   width: clamp(174px, 11.5vw, 218px);
   min-height: 104px;
   padding: 22px 22px 18px;
   background: rgba(255, 255, 246, 0.46);
+}
+
+.showcase-node.is-media-server {
+  border-color: rgba(19, 111, 116, 0.58);
+  background: rgba(217, 239, 234, 0.56);
 }
 
 .showcase-node.is-segment {
@@ -557,7 +563,8 @@ body:not(.presentation-mode) .presentation-shell {
   line-height: 1.02;
 }
 
-.showcase-node.is-endpoint .showcase-node-title {
+.showcase-node.is-endpoint .showcase-node-title,
+.showcase-node.is-media-server .showcase-node-title {
   margin-bottom: 8px;
   font-size: clamp(15px, 0.92vw, 19px);
 }
@@ -567,7 +574,8 @@ body:not(.presentation-mode) .presentation-shell {
   font-size: clamp(15px, 0.92vw, 19px);
 }
 
-.showcase-node.is-endpoint .showcase-meta {
+.showcase-node.is-endpoint .showcase-meta,
+.showcase-node.is-media-server .showcase-meta {
   font-size: clamp(12px, 0.78vw, 15px);
   line-height: 1.18;
 }
@@ -577,7 +585,8 @@ body:not(.presentation-mode) .presentation-shell {
   line-height: 1.18;
 }
 
-.showcase-node.is-endpoint .showcase-status {
+.showcase-node.is-endpoint .showcase-status,
+.showcase-node.is-media-server .showcase-status {
   min-height: 21px;
   margin-bottom: 6px;
   padding: 2px 10px;
@@ -1005,6 +1014,31 @@ body:not(.presentation-mode) .presentation-shell {
 
 .presentation-seed-form {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.presentation-smc-form {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid rgba(17, 17, 17, 0.18);
+  padding-top: 22px;
+}
+
+.source-form-heading {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 5px;
+}
+
+.source-form-heading span {
+  color: #111;
+  font-size: 13px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.source-form-heading strong {
+  color: rgba(17, 17, 17, 0.62);
+  font-size: 14px;
+  font-weight: 700;
 }
 
 .presentation-seed-toggle {
@@ -3072,6 +3106,10 @@ tr.clickable-row:hover {
   }
 
   .presentation-seed-form {
+    grid-template-columns: 1fr;
+  }
+
+  .presentation-smc-form {
     grid-template-columns: 1fr;
   }
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
+from .smc import SmcSourceConfig, discover_smc, smc_config_from_record
 from .snmp_live import SnmpSeedConfig, discover_seed
 from .state import NetWatchState
 
@@ -77,6 +78,17 @@ def load_seed_configs(
     return loaded
 
 
+def load_smc_configs(state: NetWatchState) -> dict[str, SmcSourceConfig]:
+    loaded: dict[str, SmcSourceConfig] = {}
+    for record in state.smc_sources:
+        try:
+            config = smc_config_from_record(record)
+        except (TypeError, ValueError):
+            continue
+        loaded[config.key] = config
+    return loaded
+
+
 async def poll_live_seeds(
     state: NetWatchState,
     source: str,
@@ -87,9 +99,10 @@ async def poll_live_seeds(
     configs = seed_configs if seed_configs is not None else load_seed_configs(state)
     if seed_configs is not None and not configs and state.seed_credentials:
         configs = load_seed_configs(state, seed_configs)
+    smc_configs = load_smc_configs(state)
 
-    run_id = state.start_poll_run(source, seed_count=len(configs))
-    if not configs:
+    run_id = state.start_poll_run(source, seed_count=len(configs) + len(smc_configs))
+    if not configs and not smc_configs:
         try:
             result = state.run_poll()
             if publish:
@@ -121,8 +134,23 @@ async def poll_live_seeds(
             if publish:
                 await publish({"type": "poll.completed", "event": last_result["event"], "seed": key})
 
-        if len(configs) > 1:
-            event = state.add_event(f"Live {source} finished: {successes} seed(s) ok, {failures} failed")
+        for key, config in list(smc_configs.items()):
+            try:
+                discovery = await discover_smc(config)
+            except Exception as exc:
+                failures += 1
+                last_result = state.mark_smc_poll_failed(key, str(exc))
+                if publish:
+                    await publish({"type": "poll.failed", "event": last_result["event"], "smc": key})
+                continue
+            successes += 1
+            state.register_smc_source(discovery["source"])
+            last_result = state.import_smc_discovery(discovery, key)
+            if publish:
+                await publish({"type": "poll.completed", "event": last_result["event"], "smc": key})
+
+        if len(configs) + len(smc_configs) > 1:
+            event = state.add_event(f"Live {source} finished: {successes} source(s) ok, {failures} failed")
             last_result = {"event": event, "snapshot": state.snapshot(), "successes": successes, "failures": failures}
 
         status = "succeeded" if failures == 0 and successes > 0 else "partial" if successes > 0 else "failed"

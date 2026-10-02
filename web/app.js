@@ -584,6 +584,7 @@ function getPollingSettings() {
 
 function getSeedSummaryText() {
   const seeds = appState.snapshot.seeds || [];
+  const smcSources = appState.snapshot.smc_sources || [];
   const polling = getPollingSettings();
   const runtime = appState.snapshot.runtime || {};
   const mode = appState.snapshot.mode || "mock";
@@ -591,17 +592,19 @@ function getSeedSummaryText() {
   const pollerStatus = runtime.external_poller_alive
     ? `poller ${polling.external_poller_status || "running"}`
     : "poller offline";
-  if (seeds.length === 0) return `${mode} mode / ${auto}`;
+  if (seeds.length === 0 && smcSources.length === 0) return `${mode} mode / ${auto}`;
   const loadedCredentials = Number(runtime.seed_credentials_loaded || 0);
   const savedCredentials = Number(runtime.seed_credentials_saved || 0);
-  if (mode === "live" && loadedCredentials === 0) {
+  if (mode === "live" && seeds.length > 0 && loadedCredentials === 0) {
     return savedCredentials > 0
       ? `${seeds.length} seed saved / credentials pending load`
       : `${seeds.length} seed saved / credentials missing`;
   }
   const ok = seeds.filter((seed) => seed.status === "up").length;
   const credentialSummary = savedCredentials > 0 ? ` / ${loadedCredentials} credentials loaded` : "";
-  return `${seeds.length} seed / ${ok} up${credentialSummary} / ${auto} / ${pollerStatus}`;
+  const smcUp = smcSources.filter((source) => source.status === "up").length;
+  const smcSummary = smcSources.length ? ` / ${smcSources.length} SMC / ${smcUp} up` : "";
+  return `${seeds.length} seed / ${ok} up${credentialSummary}${smcSummary} / ${auto} / ${pollerStatus}`;
 }
 
 function updateSeedSummary() {
@@ -753,14 +756,14 @@ function renderTopologyEvidencePanel() {
   `;
 }
 
-function setLiveSetupOpen(open) {
+function setLiveSetupOpen(open, focusTarget = "seed") {
   const modal = document.getElementById("liveSetupModal");
   if (!modal) return;
   modal.hidden = !open;
   if (open) {
     cancelPresentationScroll();
     syncSeedVersionFields();
-    document.getElementById("presentationSeedHost")?.focus();
+    document.getElementById(focusTarget === "smc" ? "presentationSmcHost" : "presentationSeedHost")?.focus();
   }
 }
 
@@ -1044,7 +1047,7 @@ function formatEndpointTraffic(device) {
 }
 
 function formatInterfaceTraffic(iface, device) {
-  if (device?.device_type === "endpoint" && iface.traffic_source === "switch-port") {
+  if (iface.traffic_source === "switch-port") {
     return `${formatBps(iface.in_bps)} down / ${formatBps(iface.out_bps)} up`;
   }
   return `${formatBps(iface.in_bps)} in / ${formatBps(iface.out_bps)} out`;
@@ -1062,7 +1065,7 @@ function formatMacKey(value) {
 }
 
 function isSnmpNamedSwitch(device) {
-  if (!device || device.device_type === "endpoint" || device.device_type === "segment") return false;
+  if (!device || ["endpoint", "segment", "media-server"].includes(device.device_type)) return false;
   if (device.name_source === "mac-label") return false;
   if (device.seed_key || device.lldp_sys_name || device.lldp_mgmt_ip) return true;
   if (String(device.id || "").startsWith("live-")) return true;
@@ -1076,7 +1079,8 @@ function getDeviceMacCandidates(device) {
     device?.observed_mac,
     device?.chassis_id,
     device?.fingerprint,
-    ...(device?.observed_macs || [])
+    ...(device?.observed_macs || []),
+    ...(device?.interfaces || []).map((iface) => iface.if_phys_address)
   ];
   const seen = new Set();
   return candidates
@@ -1179,10 +1183,39 @@ function summarizeDeviceVlans(device) {
   return compactList([...vlans].sort((a, b) => Number(a) - Number(b)), 8) || "n/a";
 }
 
+function formatSmcValue(value) {
+  if (value === null || value === undefined || value === "") return "n/a";
+  if (typeof value !== "object") return String(value);
+  if (value.value !== undefined) {
+    return `${value.value}${value.unit || value.units ? ` ${value.unit || value.units}` : ""}`;
+  }
+  const primitives = Object.values(value).filter((item) => ["string", "number", "boolean"].includes(typeof item));
+  return primitives.length ? primitives.join(" / ") : "available";
+}
+
+function renderSmcDeviceFacts(device) {
+  const stats = device.chassis_stats || {};
+  const power = device.power_status || {};
+  const session = device.session || {};
+  const vfcs = device.vfcs || [];
+  const temperature = stats["System Temp"] ?? stats.systemTemperature ?? stats.temperature;
+  const powerState = power["System Power"] ?? power.systemPower ?? power.status;
+  const role = session.role ?? session.Role ?? session.mode;
+  const vfcSummary = vfcs.length
+    ? compactList(vfcs.map((vfc, index) => vfc.name || vfc.type || vfc.model || vfc.slot || `VFC ${index + 1}`), 4)
+    : "none reported";
+  return `
+    <div class="device-fact"><span>Chassis power</span><strong>${escapeHtml(formatSmcValue(powerState))}</strong></div>
+    <div class="device-fact"><span>System temp</span><strong>${escapeHtml(formatSmcValue(temperature))}</strong></div>
+    <div class="device-fact"><span>Session role</span><strong>${escapeHtml(formatSmcValue(role))}</strong></div>
+    <div class="device-fact"><span>Video cards</span><strong>${escapeHtml(vfcSummary)}</strong></div>
+  `;
+}
+
 function renderPresentationDeviceInterfaces(device) {
   const interfaces = device.interfaces || [];
   if (interfaces.length === 0) {
-    return `<li class="device-interface-item"><strong>No interfaces discovered</strong><span>SNMP IF-MIB returned no rows</span></li>`;
+    return `<li class="device-interface-item"><strong>No interfaces discovered</strong><span>The managed source returned no network adapters.</span></li>`;
   }
 
   return interfaces
@@ -1223,7 +1256,7 @@ function renderPresentationDevices() {
     track.innerHTML = `
       <article class="device-card devices-placeholder-card is-active" data-device-card data-device-index="0">
         <strong>No devices yet</strong>
-        <span>Add a live seed switch or use mock data to populate the monitor.</span>
+        <span>Add a live SNMP seed or SMC host to populate the monitor.</span>
       </article>
     `;
     bindDeviceCarousel();
@@ -1240,16 +1273,22 @@ function renderPresentationDevices() {
         ? `${device.observed_source || "MAC table"}${device.observed_vlan ? ` / VLAN ${device.observed_vlan}` : ""}`
         : device.device_type === "segment"
           ? `${device.observed_mac_count || 0} MACs / ${device.observed_source || "MAC table"}`
+        : device.device_type === "media-server"
+          ? "Disguise SMC"
         : device.lldp_sys_name
           ? "LLDP neighbor"
           : "SNMP seed";
-      const portLabel = device.observed_local_port || device.lldp_local_port || "n/a";
+      const portLabel = device.device_type === "media-server"
+        ? "NIC-specific LLDP links"
+        : device.observed_local_port || device.lldp_local_port || "n/a";
       const trafficLabel = endpointTraffic
         ? `${formatBps(endpointTraffic.endpoint_in_bps)} down<br>${formatBps(endpointTraffic.endpoint_out_bps)} up`
         : `${formatBps(summary.inBps)} in<br>${formatBps(summary.outBps)} out`;
       const trafficSourceLabel = endpointTraffic
         ? `${endpointTraffic.switch_name || "switch"} / ${endpointTraffic.switch_port || portLabel}${endpointTraffic.shared_port ? ` / ${endpointTraffic.shared_endpoint_count} endpoints` : ""}`
-        : "direct interface counters";
+        : device.device_type === "media-server"
+          ? "matched switch-port counters"
+          : "direct interface counters";
       const vlanSummary = summarizeDeviceVlans(device);
       const observedMacs = device.observed_macs || [];
       const observedMacList = observedMacs.slice(0, 6).map((mac) => escapeHtml(mac)).join("<br>");
@@ -1268,11 +1307,13 @@ function renderPresentationDevices() {
               <div class="device-fact"><span>Management IP</span><strong>${escapeHtml(device.ip || "unknown")}</strong></div>
               <div class="device-fact"><span>Vendor</span><strong>${escapeHtml(device.vendor || "unknown")}</strong></div>
               <div class="device-fact"><span>Model</span><strong>${escapeHtml(device.model || "unknown")}</strong></div>
+              ${device.serial ? `<div class="device-fact"><span>Serial</span><strong>${escapeHtml(device.serial)}</strong></div>` : ""}
               ${device.description ? `<div class="device-fact"><span>Description</span><strong>${escapeHtml(device.description)}</strong></div>` : ""}
               <div class="device-fact"><span>Source</span><strong>${escapeHtml(sourceLabel)}</strong></div>
               <div class="device-fact"><span>Switch port</span><strong>${escapeHtml(portLabel)}</strong></div>
               ${device.device_type === "segment" ? `<div class="device-fact"><span>Observed MACs</span><strong>${observedMacList}${observedMacMore}</strong></div>` : ""}
-              <div class="device-fact"><span>Interfaces</span><strong>${summary.operUp}/${interfaces.length} oper up</strong></div>
+              <div class="device-fact"><span>Interfaces</span><strong>${device.device_type === "media-server" ? `${interfaces.length} SMC adapters` : `${summary.operUp}/${interfaces.length} oper up`}</strong></div>
+              ${device.device_type === "media-server" ? renderSmcDeviceFacts(device) : ""}
               <div class="device-fact"><span>Traffic</span><strong>${trafficLabel}</strong></div>
               <div class="device-fact"><span>VLANs</span><strong>${escapeHtml(vlanSummary)}</strong></div>
               <div class="device-fact"><span>Traffic source</span><strong>${escapeHtml(trafficSourceLabel)}</strong></div>
@@ -2104,8 +2145,12 @@ function isTopologySegment(device) {
   return device?.device_type === "segment" || String(device?.id || "").startsWith("segment-");
 }
 
+function isTopologyManagedHost(device) {
+  return device?.device_type === "media-server";
+}
+
 function isTopologyPeripheral(device) {
-  return isTopologyEndpoint(device) || isTopologySegment(device) || device?.status === "pending";
+  return isTopologyEndpoint(device) || isTopologySegment(device) || isTopologyManagedHost(device) || device?.status === "pending";
 }
 
 function getTopologyParentMap(devices, links, deviceMap) {
@@ -2131,7 +2176,7 @@ function getTopologyParentMap(devices, links, deviceMap) {
   });
 
   childrenByParent.forEach((children, parentId) => {
-    childrenByParent.set(parentId, children.sort(compareTopologyDeviceIds(deviceMap)));
+    childrenByParent.set(parentId, [...new Set(children)].sort(compareTopologyDeviceIds(deviceMap)));
   });
 
   return { parentByChild, childrenByParent };
@@ -2968,7 +3013,7 @@ function renderShowcaseTopology({ resetLayout = false } = {}) {
     nodes.innerHTML = `
       <div class="showcase-empty">
         <strong>No topology yet</strong>
-        <span>Add a live SNMP seed to discover LLDP neighbors.</span>
+        <span>Add a live SNMP seed or SMC host to discover managed links.</span>
       </div>
     `;
     return;
@@ -3023,6 +3068,8 @@ function renderShowcaseTopology({ resetLayout = false } = {}) {
         ? device.mac || device.fingerprint
         : device.device_type === "segment"
           ? `${device.observed_mac_count || 0} MACs`
+          : device.device_type === "media-server"
+            ? `${(device.interfaces || []).length} NICs`
           : device.ip;
       const metaLines = device.device_type === "endpoint"
         ? [
@@ -3036,11 +3083,15 @@ function renderShowcaseTopology({ resetLayout = false } = {}) {
               device.observed_local_port || "shared switch port",
               device.observed_local_port_alias || model
             ]
+          : device.device_type === "media-server"
+            ? [source, device.serial || device.ip || "unknown", model]
         : [source || "unknown", device.vendor || "Unknown", model];
       const kindClass = isTopologySegment(device)
         ? "is-segment"
         : isTopologyEndpoint(device)
           ? "is-endpoint"
+          : isTopologyManagedHost(device)
+            ? "is-media-server"
           : device.status === "pending"
             ? "is-pending"
             : "is-seed";
@@ -3434,6 +3485,40 @@ async function submitPresentationSeed(event) {
   }
 }
 
+async function submitPresentationSmc(event) {
+  event.preventDefault();
+  const resultEl = document.getElementById("presentationSmcResult");
+  const submit = document.getElementById("presentationSmcSubmitButton");
+  const payload = {
+    host: document.getElementById("presentationSmcHost").value.trim(),
+    port: Number(document.getElementById("presentationSmcPort").value || 80),
+    scheme: document.getElementById("presentationSmcScheme").value
+  };
+  resultEl.className = "seed-result";
+  resultEl.textContent = "Reading SMC chassis, network adapters and hardware status...";
+  submit.disabled = true;
+  try {
+    const result = await apiPostJson("/api/live/smc", payload);
+    appState.snapshot = result.snapshot;
+    const imported = result.snapshot.devices.find((device) => device.smc_source_key === result.source.key);
+    appState.selectedDeviceId = imported?.id || appState.selectedDeviceId;
+    resultEl.className = "seed-result success";
+    resultEl.textContent = `Imported ${result.machine.hostname || payload.host}: ${result.counts.interfaces} NICs, ${result.counts.hardware_stats} chassis readings, ${result.counts.vfcs} VFCs.`;
+    renderAll();
+    await setBackendPolling(
+      document.getElementById("presentationBackendPollToggle").checked,
+      Number(document.getElementById("presentationPollInterval").value || 30)
+    );
+    setLiveSetupOpen(false);
+    switchView("devices");
+  } catch (error) {
+    resultEl.className = "seed-result error";
+    resultEl.textContent = `SMC test failed: ${error.message}`;
+  } finally {
+    submit.disabled = false;
+  }
+}
+
 function startAutoPoll() {
   stopAutoPoll();
   const toggle = document.getElementById("autoPollToggle");
@@ -3523,12 +3608,14 @@ function bindEvents() {
     button.addEventListener("click", () => setMonitorViewMode(button.dataset.monitorView));
   });
   document.getElementById("historyBackButton")?.addEventListener("click", () => setHistoryOverlayOpen(false));
-  document.getElementById("presentationSetupButton")?.addEventListener("click", () => setLiveSetupOpen(true));
+  document.getElementById("presentationSetupButton")?.addEventListener("click", () => setLiveSetupOpen(true, "seed"));
+  document.getElementById("presentationSmcButton")?.addEventListener("click", () => setLiveSetupOpen(true, "smc"));
   document.getElementById("presentationClearAllButton")?.addEventListener("click", () => clearLiveInventory());
   document.getElementById("liveSetupClose")?.addEventListener("click", () => setLiveSetupOpen(false));
   document.getElementById("liveSetupBackdrop")?.addEventListener("click", () => setLiveSetupOpen(false));
   document.getElementById("presentationClearLiveButton")?.addEventListener("click", () => clearLiveInventory("presentationSeedResult"));
   document.getElementById("presentationSeedForm")?.addEventListener("submit", submitPresentationSeed);
+  document.getElementById("presentationSmcForm")?.addEventListener("submit", submitPresentationSmc);
   document.getElementById("presentationSeedVersion")?.addEventListener("change", syncSeedVersionFields);
   document.getElementById("presentationBackendPollToggle")?.addEventListener("change", async () => {
     await setBackendPolling(
