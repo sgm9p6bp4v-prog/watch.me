@@ -1127,10 +1127,16 @@ class NetWatchState:
         record_history: bool = True,
     ) -> dict[str, Any]:
         self.mode = "live"
-        self.live_failures = 0
         device = deepcopy(discovery["device"])
+        collection = deepcopy(discovery.get("topology_collection", {"complete": True}))
+        topology_complete = collection.get("complete") is True
         if seed_key:
             device["seed_key"] = seed_key
+            for seed in self.seeds:
+                if seed.get("key") == seed_key:
+                    seed["consecutive_failures"] = 0
+                    seed["topology_collection"] = collection
+        device["topology_collection"] = collection
         device["last_seen"] = now_iso()
         self._calculate_live_rates(device)
         self._apply_device_label_to_device(device)
@@ -1138,7 +1144,6 @@ class NetWatchState:
         devices_by_id = {
             item["id"]: deepcopy(item)
             for item in self.devices
-            if not self._should_replace_auto_discovery_item(item, seed_key)
         }
         candidate_remap: dict[str, str] = {}
         candidate_interface_remap: dict[str, str] = {}
@@ -1183,10 +1188,19 @@ class NetWatchState:
                 continue
             match_id = self._find_existing_device_id(candidate, devices_by_id)
             if match_id and match_id != candidate["id"] and devices_by_id[match_id].get("status") != "pending":
-                candidate_remap[candidate["id"]] = match_id
+                candidate_id = candidate["id"]
+                candidate_remap[candidate_id] = match_id
+                matched = devices_by_id[match_id]
+                if matched.get("device_type") == "endpoint" and candidate.get("mac"):
+                    candidate["id"] = match_id
+                    old_interfaces = matched.get("interfaces", [])
+                    if old_interfaces and candidate.get("interfaces"):
+                        candidate["interfaces"][0]["id"] = old_interfaces[0]["id"]
+                        candidate_interface_remap[candidate_id] = old_interfaces[0]["id"]
+                    self._merge_device(devices_by_id, candidate)
                 interface_id = self._matched_infrastructure_interface_id(candidate, devices_by_id.get(match_id))
                 if interface_id:
-                    candidate_interface_remap[candidate["id"]] = interface_id
+                    candidate_interface_remap[candidate_id] = interface_id
                 continue
             self._merge_device(devices_by_id, candidate)
         self.devices = list(devices_by_id.values())
@@ -1200,9 +1214,12 @@ class NetWatchState:
             candidate_remap,
             seed_key,
             candidate_interface_remap=candidate_interface_remap,
+            topology_complete=topology_complete,
         )
+        self._reconcile_described_endpoints()
         self._deduplicate_observed_topology()
-        self._prune_unlinked_observed_endpoints(seed_key)
+        if topology_complete:
+            self._prune_unlinked_observed_endpoints(seed_key)
         self._propagate_endpoint_port_traffic()
         if record_history:
             self._record_interface_history(self.devices)
@@ -1214,11 +1231,18 @@ class NetWatchState:
             f"{counts['interfaces']} interfaces, {counts['lldp_candidates']} LLDP candidates, "
             f"{counts.get('mac_endpoints', 0)} MAC endpoints, "
             f"{counts.get('described_endpoints', 0)} described endpoints"
+            + ("; topology incomplete, previous observations retained" if not topology_complete else "")
         )
         return {"event": event, "snapshot": self.snapshot()}
 
     def import_live_metrics(self, metrics: dict[str, Any], seed_key: str) -> dict[str, Any]:
-        device = next((item for item in self.devices if item.get("seed_key") == seed_key), None)
+        device = next(
+            (item for item in self.devices if item.get("seed_key") == seed_key
+             and item.get("device_type") not in {"endpoint", "segment"}
+             and not str(item.get("id") or "").startswith("candidate-")
+             and item.get("status") != "pending"),
+            None,
+        )
         if device is None:
             raise ValueError(f"seed {seed_key} has no imported device inventory")
 
@@ -1249,12 +1273,12 @@ class NetWatchState:
 
         device["status"] = "up"
         device["last_seen"] = now_iso()
-        self.live_failures = 0
         self._calculate_live_rates(device)
         for seed in self.seeds:
             if seed.get("key") != seed_key:
                 continue
             seed["status"] = "up"
+            seed["consecutive_failures"] = 0
             seed["last_error"] = ""
             seed["last_counts"] = {**seed.get("last_counts", {}), **metrics.get("counts", {})}
 
@@ -1268,8 +1292,15 @@ class NetWatchState:
         self.persist()
 
     def mark_live_poll_failed(self, reason: str, seed_key: str | None = None) -> dict[str, Any]:
-        self.live_failures += 1
-        status = "down" if self.live_failures >= 3 else "unknown"
+        seed = next((item for item in self.seeds if item.get("key") == seed_key), None)
+        if seed_key:
+            failures = int((seed or {}).get("consecutive_failures") or 0) + 1
+            if seed is not None:
+                seed["consecutive_failures"] = failures
+        else:
+            self.live_failures += 1
+            failures = self.live_failures
+        status = "down" if failures >= 3 else "unknown"
         for device in self.devices:
             if device.get("status") != "pending" and (seed_key is None or device.get("seed_key") == seed_key):
                 device["status"] = status
@@ -1282,9 +1313,12 @@ class NetWatchState:
             if seed_key is None or seed.get("key") == seed_key:
                 seed["status"] = status
                 seed["last_error"] = reason
+        for link in self.links:
+            if seed_key is None or link.get("seed_key") == seed_key:
+                self._mark_link_for_confirmation(link, "SNMP poll failed; last known connection retained")
         self._propagate_endpoint_port_traffic()
         self._sync_alerts_from_devices()
-        event = self.add_event(f"Live poll failed ({self.live_failures}/3): {reason}")
+        event = self.add_event(f"Live poll failed ({seed_key or 'all seeds'}, {failures}/3): {reason}")
         return {"event": event, "snapshot": self.snapshot()}
 
     def _calculate_live_rates(self, device: dict[str, Any]) -> None:
@@ -1343,12 +1377,17 @@ class NetWatchState:
             source = interfaces_by_id.get(link.get("from_interface"))
             if not endpoint or not source:
                 continue
+            if link.get("needs_confirmation"):
+                continue
             switch, switch_interface = source
             endpoint_interfaces = endpoint.get("interfaces") or []
             if not endpoint_interfaces:
                 continue
 
-            shared_count = endpoint_links_by_interface.get(link["from_interface"], 0)
+            shared_count = max(
+                endpoint_links_by_interface.get(link["from_interface"], 0),
+                int(endpoint.get("observed_port_mac_count") or 0),
+            )
             traffic_note = "shared switch port" if shared_count > 1 else "single endpoint switch port"
             traffic = {
                 "source": "switch-port",
@@ -1452,6 +1491,8 @@ class NetWatchState:
         if existing:
             if existing.get("layout"):
                 device["layout"] = existing["layout"]
+            if "missing_inventory_polls" in existing:
+                device["missing_inventory_polls"] = existing["missing_inventory_polls"]
             device["alerting_enabled"] = existing.get("alerting_enabled", device.get("alerting_enabled", True))
             if existing.get("management_mac") and not device.get("management_mac"):
                 device["management_mac"] = existing["management_mac"]
@@ -1512,16 +1553,46 @@ class NetWatchState:
         if not seed_key:
             return
         linked_ids = {link.get("from") for link in self.links} | {link.get("to") for link in self.links}
-        self.devices = [
-            device
-            for device in self.devices
-            if not (
-                device.get("seed_key") == seed_key
-                and device.get("device_type") in {"endpoint", "segment"}
-                and device.get("status") == "observed"
-                and device.get("id") not in linked_ids
-            )
-        ]
+        kept = []
+        for device in self.devices:
+            auto_observation = device.get("device_type") in {"endpoint", "segment"} or str(device.get("id") or "").startswith("candidate-")
+            if device.get("seed_key") == seed_key and auto_observation and device.get("id") not in linked_ids:
+                device["missing_inventory_polls"] = int(device.get("missing_inventory_polls") or 0) + 1
+                if device["missing_inventory_polls"] >= OBSERVED_MAC_LINK_MISSING_POLL_CAP:
+                    continue
+            elif device.get("id") in linked_ids:
+                device["missing_inventory_polls"] = 0
+            kept.append(device)
+        self.devices = kept
+
+    def _mark_link_for_confirmation(self, link: dict[str, Any], reason: str) -> None:
+        link["stale"] = True
+        link["needs_confirmation"] = True
+        link["revalidation_reason"] = reason
+
+    def _reconcile_described_endpoints(self) -> None:
+        # A fresh MAC on the same switch port supersedes its anonymous description.
+        devices = {device["id"]: device for device in self.devices}
+        mac_links: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for link in self.links:
+            target = devices.get(link.get("to"), {})
+            if target.get("device_type") == "endpoint" and self._device_mac_label_key(target) and not link.get("stale"):
+                key = (str(link.get("from")), str(link.get("from_interface")))
+                mac_links.setdefault(key, []).append(link)
+        replaced: set[str] = set()
+        for link in self.links:
+            target = devices.get(link.get("to"), {})
+            if str(target.get("observed_source") or "").upper() != "PORT-DESCRIPTION" or self._device_mac_label_key(target):
+                continue
+            matches = mac_links.get((str(link.get("from")), str(link.get("from_interface"))), [])
+            if len(matches) == 1 and int(matches[0].get("port_mac_count") or 1) <= 1:
+                replacement = devices[matches[0]["to"]]
+                if target.get("layout") and replacement.get("layout", {}).get("source") == "auto":
+                    replacement["layout"] = deepcopy(target["layout"])
+                replaced.add(target["id"])
+        if replaced:
+            self.links = [link for link in self.links if link.get("to") not in replaced]
+            self.devices = [device for device in self.devices if device["id"] not in replaced]
 
     def _annotate_topology_links(self) -> bool:
         changed = False
@@ -1546,6 +1617,9 @@ class NetWatchState:
         link["directness"] = self._link_directness(link, sources, confidence)
         link["line_style"] = "solid" if confidence >= 75 else "dashed"
         link.setdefault("topology_decision", self._default_topology_decision(link))
+        if link.get("needs_confirmation"):
+            link["line_style"] = "dashed"
+            link["topology_decision"] = "Awaiting reconfirmation: " + str(link.get("revalidation_reason") or "last known connection")
         after = {
             "evidence_sources": link.get("evidence_sources"),
             "confidence": link.get("confidence"),
@@ -1756,19 +1830,12 @@ class NetWatchState:
             infrastructure_interfaces,
             infrastructure_ports,
         ) or changed
-        if changed:
-            linked_ids = {link.get("from") for link in self.links} | {link.get("to") for link in self.links}
-            self.devices = [
-                device
-                for device in self.devices
-                if device.get("device_type") not in {"endpoint", "segment"} or device.get("id") in linked_ids
-            ]
         return changed
 
     def _clear_seen_observed_link_stale_flags(self) -> bool:
         changed = False
         for link in self.links:
-            if link.get("stale") and int(link.get("missing_polls") or 0) <= 0:
+            if link.get("stale") and not link.get("needs_confirmation") and int(link.get("missing_polls") or 0) <= 0:
                 link["stale"] = False
                 changed = True
         return changed
@@ -2092,8 +2159,6 @@ class NetWatchState:
         links_to_remove: set[str] = set()
         endpoint_updates: dict[str, dict[str, Any]] = {}
         for links in observed_links_by_mac.values():
-            if len(links) <= 1:
-                continue
             best = max(
                 links,
                 key=lambda link: self._observed_link_score(
@@ -2113,9 +2178,16 @@ class NetWatchState:
             best["candidate_observation_count"] = len(links)
             best["suppressed_observation_count"] = len(links) - 1
             best["topology_decision"] = self._observed_link_selection_reason(best, len(links))
-
-        if not links_to_remove:
-            return False
+            best["candidate_observations"] = [
+                {
+                    "switch": devices_by_id.get(link.get("from"), {}).get("name") or link.get("from"),
+                    "port": link.get("local_port"),
+                    "last_seen": link.get("last_seen"),
+                    "evidence": link.get("evidence"),
+                    "selected": link is best,
+                }
+                for link in links
+            ]
 
         self.links = [link for link in self.links if str(link.get("id") or "") not in links_to_remove]
         for endpoint_id, link in endpoint_updates.items():
@@ -2124,7 +2196,7 @@ class NetWatchState:
             if endpoint and source:
                 _, source_interface = source
                 self._update_endpoint_observation(endpoint, link, source_interface)
-        return True
+        return bool(links_to_remove)
 
     def _observed_infrastructure_link_mac_key(self, target: dict[str, Any], link: dict[str, Any]) -> str:
         remote_key = self._mac_label_key(link.get("management_mac") or link.get("remote_port"))
@@ -2149,7 +2221,11 @@ class NetWatchState:
         missing_polls = int(link.get("missing_polls") or 0)
         if missing_polls > 0:
             score -= missing_polls * 60
+        elif link.get("needs_confirmation"):
+            score -= 60
         if from_interface_id and observed_link_count_by_interface.get(from_interface_id, 0) > 1:
+            score -= 140
+        if int(link.get("port_mac_count") or 0) > 1:
             score -= 140
         source = interface_index.get(from_interface_id)
         if source:
@@ -2228,6 +2304,9 @@ class NetWatchState:
         port_alias = source_interface.get("if_alias") or ""
         endpoint["observed_local_port"] = port_name
         endpoint["observed_local_port_alias"] = port_alias
+        endpoint["seed_key"] = link.get("seed_key") or endpoint.get("seed_key")
+        if "port_mac_count" in link:
+            endpoint["observed_port_mac_count"] = link["port_mac_count"]
         endpoint["observed_source"] = link.get("evidence") or endpoint.get("observed_source") or "MAC table"
         if port_alias and endpoint.get("name_source") not in {"mac-label", "device-label"}:
             endpoint["name"] = port_alias
@@ -2276,6 +2355,8 @@ class NetWatchState:
                     return device_id
                 if candidate_chassis and device_chassis and candidate_chassis == device_chassis:
                     return device_id
+            return None
+        if candidate.get("device_type") in {"endpoint", "segment"}:
             return None
         for device_id, device in devices_by_id.items():
             if device.get("status") == "pending":
@@ -2458,20 +2539,23 @@ class NetWatchState:
         candidate_remap: dict[str, str],
         seed_key: str | None,
         candidate_interface_remap: dict[str, str] | None = None,
+        topology_complete: bool = True,
     ) -> None:
         candidate_interface_remap = candidate_interface_remap or {}
         merged: dict[str, dict[str, Any]] = {}
         devices_by_id = {device.get("id"): device for device in self.devices if device.get("id")}
         for existing_link in self.links:
             if seed_key and existing_link.get("seed_key") == seed_key:
-                if not self._is_sticky_observed_infrastructure_mac_link(existing_link, devices_by_id):
-                    continue
-                missing_polls = int(existing_link.get("missing_polls") or 0) + 1
-                if missing_polls > OBSERVED_MAC_LINK_MISSING_POLL_CAP:
+                missing_polls = int(existing_link.get("missing_polls") or 0) + int(topology_complete)
+                if topology_complete and missing_polls >= OBSERVED_MAC_LINK_MISSING_POLL_CAP:
+                    target = devices_by_id.get(existing_link.get("to"))
+                    if target:
+                        target["missing_inventory_polls"] = OBSERVED_MAC_LINK_MISSING_POLL_CAP - 1
                     continue
                 link = deepcopy(existing_link)
                 link["missing_polls"] = missing_polls
-                link["stale"] = True
+                reason = "Absent in complete discovery" if topology_complete else "Incomplete SNMP topology tables"
+                self._mark_link_for_confirmation(link, reason)
             else:
                 link = deepcopy(existing_link)
             link["from"] = candidate_remap.get(link["from"], link["from"])
@@ -2488,6 +2572,9 @@ class NetWatchState:
             link["to"] = candidate_remap.get(link["to"], link["to"])
             if old_to in candidate_interface_remap:
                 link["to_interface"] = candidate_interface_remap[old_to]
+            target = devices_by_id.get(link.get("to"), {})
+            if "observed_port_mac_count" in target:
+                link["port_mac_count"] = target["observed_port_mac_count"]
             if link.get("from") == link.get("to"):
                 continue
             persisted_management_link = self._persisted_management_port_link(
@@ -2505,10 +2592,16 @@ class NetWatchState:
                 link["seed_key"] = seed_key
             link["missing_polls"] = 0
             link["stale"] = False
+            link["needs_confirmation"] = False
+            link.pop("revalidation_reason", None)
             link["last_seen"] = now_iso()
             self._classify_management_link(link, devices_by_id)
             link["id"] = self._stable_link_id(link)
             existing = merged.get(link["id"], {})
+            existing.pop("evidence_sources", None)
+            existing.pop("revalidation_reason", None)
+            existing.pop("topology_decision", None)
+            link.pop("topology_decision", None)
             merged[link["id"]] = {**existing, **link}
         self.links = list(merged.values())
         self._confirm_reciprocal_links()
@@ -2599,6 +2692,8 @@ class NetWatchState:
     def _confirm_reciprocal_links(self) -> None:
         devices_by_id = {device.get("id"): device for device in self.devices if device.get("id")}
         for link in self.links:
+            if link.get("needs_confirmation"):
+                continue
             from_device = devices_by_id.get(link.get("from"))
             to_device = devices_by_id.get(link.get("to"))
             if (
@@ -2623,13 +2718,15 @@ class NetWatchState:
                     link["evidence"] = "LLDP one side + SNMP seed match"
                     link.pop("evidence_sources", None)
             for other in self.links:
-                if link is other:
+                if link is other or other.get("needs_confirmation"):
                     continue
                 if link.get("from") == other.get("to") and link.get("to") == other.get("from"):
                     link["status"] = "confirmed"
                     other["status"] = "confirmed"
                     link["evidence"] = "LLDP both sides"
                     other["evidence"] = "LLDP both sides"
+                    link.pop("evidence_sources", None)
+                    other.pop("evidence_sources", None)
 
     def _alerts_from_live_devices(self, devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
         alerts: list[dict[str, Any]] = []

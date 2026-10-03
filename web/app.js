@@ -1272,6 +1272,14 @@ function renderPresentationDevices() {
       const observedMacs = device.observed_macs || [];
       const observedMacList = observedMacs.slice(0, 6).map((mac) => escapeHtml(mac)).join("<br>");
       const observedMacMore = observedMacs.length > 6 ? `<br>+${observedMacs.length - 6}` : "";
+      const connectionFacts = (appState.snapshot.links || [])
+        .filter((link) => link.to === device.id && link.from !== device.id)
+        .map((link) => {
+          const source = devices.find((item) => item.id === link.from);
+          const lastSeen = link.last_seen ? new Date(link.last_seen).toLocaleString() : "unknown";
+          return `<div class="device-fact"><span>Connection</span><strong>${escapeHtml(source?.name || link.from)} / ${escapeHtml(link.local_port || "unknown port")}<br>${escapeHtml(link.evidence || "unknown evidence")}</strong></div>
+            <div class="device-fact"><span>Last confirmed</span><strong>${escapeHtml(lastSeen)}<br>${link.needs_confirmation ? "Awaiting reconfirmation" : "Observed"}</strong></div>`;
+        }).join("");
       return `
         <article class="device-card" data-device-card data-device-index="${index}" data-device-card-id="${escapeHtml(device.id)}">
           <header class="device-card-head">
@@ -1290,6 +1298,7 @@ function renderPresentationDevices() {
               ${device.description ? `<div class="device-fact"><span>Description</span><strong>${escapeHtml(device.description)}</strong></div>` : ""}
               <div class="device-fact"><span>Source</span><strong>${escapeHtml(sourceLabel)}</strong></div>
               <div class="device-fact"><span>Switch port</span><strong>${escapeHtml(portLabel)}</strong></div>
+              ${connectionFacts}
               ${device.device_type === "segment" ? `<div class="device-fact"><span>Observed MACs</span><strong>${observedMacList}${observedMacMore}</strong></div>` : ""}
               <div class="device-fact"><span>Interfaces</span><strong>${device.device_type === "media-server" ? `${interfaces.length} SMC adapters` : `${summary.operUp}/${interfaces.length} oper up`}</strong></div>
               ${device.device_type === "media-server" ? renderSmcDeviceFacts(device) : ""}

@@ -27,6 +27,7 @@ from pysnmp.hlapi.asyncio import (
     usmNoAuthProtocol,
     usmNoPrivProtocol,
 )
+from pysnmp.proto.rfc1905 import EndOfMibView, NoSuchInstance, NoSuchObject
 
 
 SYSTEM_OIDS = {
@@ -346,6 +347,21 @@ async def _get_system(config: SnmpSeedConfig) -> dict[str, str]:
     return {key: _text(var_binds[index][1]) for index, key in enumerate(SYSTEM_OIDS)}
 
 
+class _CollectionRows(dict):
+    """Keep walk diagnostics out of row keys and preserve dict-based mocks."""
+
+    def __init__(self, rows=None, *, complete=True, errors=None):
+        super().__init__(rows or {})
+        self.complete = complete
+        self.errors = list(errors or [])
+
+
+class _PartialWalkError(RuntimeError):
+    def __init__(self, message: str, rows: dict[str, Any]):
+        super().__init__(message)
+        self.rows = rows
+
+
 async def _walk_table(
     config: SnmpSeedConfig,
     base_oid: str,
@@ -354,28 +370,37 @@ async def _walk_table(
     transport_target: UdpTransportTarget | None = None,
 ) -> dict[str, Any]:
     rows: dict[str, Any] = {}
-    async for error_indication, error_status, error_index, var_binds in bulk_walk_cmd(
-        snmp_engine or SnmpEngine(),
-        _auth_data(config),
-        transport_target or await _target(config),
-        ContextData(),
-        0,
-        25,
-        ObjectType(ObjectIdentity(base_oid)),
-        lexicographicMode=False,
-    ):
-        if error_indication:
-            raise RuntimeError(str(error_indication))
-        if error_status:
-            problem = var_binds[int(error_index) - 1][0] if error_index else "unknown OID"
-            raise RuntimeError(f"{error_status.prettyPrint()} at {problem}")
-        for oid, value in var_binds:
-            index = _suffix(oid, base_oid)
-            if index is not None:
-                rows[index] = value
-                if max_rows is not None and len(rows) >= max_rows:
-                    return rows
-    return rows
+    try:
+        async for error_indication, error_status, error_index, var_binds in bulk_walk_cmd(
+            snmp_engine or SnmpEngine(),
+            _auth_data(config),
+            transport_target or await _target(config),
+            ContextData(),
+            0,
+            25,
+            ObjectType(ObjectIdentity(base_oid)),
+            lexicographicMode=False,
+        ):
+            if error_indication:
+                raise RuntimeError(str(error_indication))
+            if error_status:
+                problem = var_binds[int(error_index) - 1][0] if error_index else "unknown OID"
+                raise RuntimeError(f"{error_status.prettyPrint()} at {problem}")
+            for oid, value in var_binds:
+                if isinstance(value, (EndOfMibView, NoSuchInstance, NoSuchObject)):
+                    continue
+                index = _suffix(oid, base_oid)
+                if index is not None:
+                    rows[index] = value
+                    if max_rows is not None and len(rows) >= max_rows:
+                        return _CollectionRows(rows, complete=False, errors=[f"max_rows={max_rows} reached"])
+    except asyncio.CancelledError as error:
+        # asyncio deadlines require the original CancelledError type.
+        error.rows = rows
+        raise
+    except (RuntimeError, TimeoutError, OSError) as error:
+        raise _PartialWalkError(str(error), rows) from error
+    return _CollectionRows(rows)
 
 
 async def _walk_many(config: SnmpSeedConfig, tables: dict[str, str]) -> dict[str, dict[str, Any]]:
@@ -409,20 +434,38 @@ async def _walk_many_bounded(
 
 async def _walk_optional_table(config: SnmpSeedConfig, oid: str, max_rows: int = 768) -> dict[str, Any]:
     try:
-        return await asyncio.wait_for(_walk_table(config, oid, max_rows=max_rows), timeout=8)
-    except (RuntimeError, TimeoutError):
-        return {}
+        rows = await asyncio.wait_for(_walk_table(config, oid, max_rows=max_rows), timeout=8)
+    except (RuntimeError, TimeoutError, OSError) as error:
+        partial = getattr(error, "rows", getattr(error.__cause__, "rows", {}))
+        reason = "timeout" if isinstance(error, TimeoutError) else str(error)
+        return _CollectionRows(partial, complete=False, errors=[reason or type(error).__name__])
+    if len(rows) >= max_rows and getattr(rows, "complete", True):
+        return _CollectionRows(rows, complete=False, errors=[f"max_rows={max_rows} reached"])
+    return rows
 
 
 async def _walk_many_optional(config: SnmpSeedConfig, tables: dict[str, str]) -> dict[str, dict[str, Any]]:
     async def walk_item(name: str, oid: str) -> tuple[str, dict[str, Any]]:
         try:
             return name, await _walk_optional_table(config, oid)
-        except RuntimeError:
-            return name, {}
+        except (RuntimeError, TimeoutError, OSError) as error:
+            return name, _CollectionRows(
+                getattr(error, "rows", {}), complete=False, errors=[str(error) or type(error).__name__]
+            )
 
     pairs = await asyncio.gather(*(walk_item(name, oid) for name, oid in tables.items()))
     return dict(pairs)
+
+
+def _collection_errors(tables: dict, names, source: str) -> list[str]:
+    errors = []
+    for name in names:
+        if name not in tables:
+            errors.append(f"{source}.{name}: missing table")
+        elif not getattr(tables[name], "complete", True):
+            reasons = getattr(tables[name], "errors", []) or ["incomplete collection"]
+            errors.extend(f"{source}.{name}: {reason}" for reason in reasons)
+    return errors
 
 
 def _status(table: dict[str, Any], index: str, mapping: dict[int, str]) -> str:
@@ -823,6 +866,36 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
         if _int(port) > 0 and _int(raw_if_index) > 0
     }
     endpoint_rows = _fdb_rows(bridge, q_bridge, bridge_port_to_if_index)
+    fdb_errors = _collection_errors(bridge, BRIDGE_OIDS, "bridge")
+    fdb_errors.extend(_collection_errors(q_bridge, ("q_fdb_port", "q_fdb_status"), "q_bridge"))
+    for source, port_rows, status_rows in (
+        ("bridge", bridge["fdb_port"], bridge["fdb_status"]),
+        ("q_bridge", q_bridge["q_fdb_port"], q_bridge["q_fdb_status"]),
+    ):
+        missing_statuses = set(port_rows) - set(status_rows)
+        missing_ports = {
+            index for index, status in status_rows.items()
+            if index not in port_rows and _int(status) in {3, 5}
+            and _is_usable_endpoint_mac(_mac_from_suffix(index))
+        }
+        if missing_statuses or missing_ports:
+            fdb_errors.append(f"{source}: inconsistent FDB port/status rows")
+        for index, raw_port in port_rows.items():
+            port = str(_int(raw_port))
+            if _int(raw_port) <= 0 or not _is_usable_endpoint_mac(_mac_from_suffix(index)):
+                continue
+            status = _int(status_rows.get(index), 3)
+            if status not in {3, 5}:
+                continue
+            if bridge_port_to_if_index.get(port) not in interface_by_index:
+                fdb_errors.append(f"{source}: unresolved bridge port {port}")
+    # ARP identities can be needed to match an FDB observation to a known device.
+    if endpoint_rows:
+        fdb_errors.extend(_collection_errors(arp, ("ip_net_to_media_phys_address",), "arp"))
+    lldp_errors = _collection_errors(lldp, LLDP_OIDS, lldp_oid_profile)
+    lldp_errors.extend(_collection_errors(local_lldp, LLDP_LOCAL_OIDS, f"{lldp_oid_profile}.local"))
+    mgmt_oids = FS_LLDP_REMOTE_MGMT_OIDS if lldp_oid_profile == "fs-private" else LLDP_REMOTE_MGMT_OIDS
+    lldp_errors.extend(_collection_errors(remote_mgmt, mgmt_oids, f"{lldp_oid_profile}.management"))
     if lldp_oid_profile == "fs-private":
         remote_mgmt_rows = remote_mgmt["remote_mgmt_address"]
         remote_mgmt_ips = _fs_lldp_management_addresses(remote_mgmt_rows)
@@ -835,6 +908,8 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
         lldp_oid_profile,
         endpoint_rows,
     )
+    if suppressed_remote_indexes and fdb_errors:
+        lldp_errors.append("fs-private: incomplete FDB evidence for anonymous LLDP rows")
     for index in remote_indexes:
         remote_chassis_id = _lldp_id_text(lldp["remote_chassis_id"].get(index))
         remote_sys_name = _text(lldp["remote_sys_name"].get(index)).strip()
@@ -917,6 +992,7 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
         if interface.get("if_phys_address")
     }
     known_macs.update(_normalize_mac(candidate.get("chassis_id")) for candidate in candidates)
+    known_macs.add(_normalize_mac(management_mac))
     known_macs.discard("")
     vlan_config_by_if_index = _vlan_config_by_if_index(q_bridge, bridge_port_to_if_index)
     for if_index, vlan_config in vlan_config_by_if_index.items():
@@ -927,6 +1003,8 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
     fdb_macs_by_if_index: dict[str, set[str]] = {}
     fdb_rows_by_if_index: dict[str, list[dict[str, str]]] = {}
     for row in endpoint_rows:
+        if row["mac"] in known_macs:
+            continue
         fdb_macs_by_if_index.setdefault(row["if_index"], set()).add(row["mac"])
         fdb_rows_by_if_index.setdefault(row["if_index"], []).append(row)
 
@@ -985,6 +1063,7 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
                 "observed_source": row["source_table"],
                 "observed_local_port": local_port_name,
                 "observed_local_port_alias": local_port_alias,
+                "observed_port_mac_count": port_mac_count,
                 "alerting_enabled": False,
                 "layout": {"x": 940, "y": 180 + endpoint_count * 95, "locked": False, "source": "auto"},
                 "interfaces": [
@@ -1142,6 +1221,7 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
                 "observed_local_port_alias": local_port_alias,
                 "observed_macs": portdesc_macs,
                 "observed_mac_count": len(portdesc_macs),
+                "observed_port_mac_count": len(fdb_macs_by_if_index.get(if_index, set())),
                 "alerting_enabled": False,
                 "layout": {"x": 940, "y": 180 + (endpoint_count + described_endpoint_count) * 95, "locked": False, "source": "auto"},
                 "interfaces": [
@@ -1196,6 +1276,12 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
         "candidates": candidates,
         "links": candidate_links,
         "system": system,
+        "topology_collection": {
+            "complete": not (lldp_errors or fdb_errors),
+            "lldp_complete": not lldp_errors,
+            "fdb_complete": not fdb_errors,
+            "errors": list(dict.fromkeys(lldp_errors + fdb_errors)),
+        },
         "counts": {
             "interfaces": len(interfaces),
             "lldp_candidates": len(remote_indexes),

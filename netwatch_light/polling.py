@@ -8,7 +8,7 @@ from .snmp_live import SnmpSeedConfig, discover_seed, discover_seed_metrics
 from .state import NetWatchState
 
 PublishCallback = Callable[[dict[str, Any]], Awaitable[None]]
-SOURCE_DISCOVERY_CONCURRENCY = 8
+SOURCE_DISCOVERY_CONCURRENCY = 4
 METRIC_POLL_CONCURRENCY = 4
 
 
@@ -29,6 +29,7 @@ def seed_metadata(config: SnmpSeedConfig, discovery: dict[str, Any], status: str
         "status": status,
         "last_error": "",
         "last_counts": discovery.get("counts", {}),
+        "topology_collection": discovery.get("topology_collection", {"complete": True}),
     }
 
 
@@ -120,6 +121,7 @@ async def poll_live_seeds(
 
     successes = 0
     failures = 0
+    incomplete_topologies = 0
     last_result: dict[str, Any] | None = None
     try:
         semaphore = asyncio.Semaphore(SOURCE_DISCOVERY_CONCURRENCY)
@@ -127,7 +129,12 @@ async def poll_live_seeds(
         async def discover_snmp(key: str, config: SnmpSeedConfig) -> dict[str, Any]:
             async with semaphore:
                 try:
-                    discovery = await discover_seed(config, labeled_macs=set(state.mac_labels))
+                    known_macs = set(state.mac_labels)
+                    known_macs.update(
+                        str(device.get("mac")) for device in state.devices
+                        if device.get("device_type") == "endpoint" and device.get("mac")
+                    )
+                    discovery = await discover_seed(config, labeled_macs=known_macs)
                     return {"kind": "snmp", "key": key, "config": config, "discovery": discovery}
                 except Exception as exc:
                     return {"kind": "snmp", "key": key, "config": config, "error": exc}
@@ -160,6 +167,8 @@ async def poll_live_seeds(
                         continue
                     discovery = item["discovery"]
                     successes += 1
+                    if discovery.get("topology_collection", {}).get("complete") is False:
+                        incomplete_topologies += 1
                     state.register_live_seed(seed_metadata(config, discovery))
                     last_result = state.import_live_discovery(discovery, key, record_history=False)
                     if publish:
@@ -181,11 +190,17 @@ async def poll_live_seeds(
 
             state.record_interface_history()
             if len(configs) + len(smc_configs) > 1:
-                event = state.add_event(f"Live {source} finished: {successes} source(s) ok, {failures} failed")
+                event = state.add_event(
+                    f"Live {source} finished: {successes} source(s) ok, {failures} failed, "
+                    f"{incomplete_topologies} topology collection(s) incomplete"
+                )
                 last_result = {"event": event, "snapshot": state.snapshot(), "successes": successes, "failures": failures}
 
-            status = "succeeded" if failures == 0 and successes > 0 else "partial" if successes > 0 else "failed"
-            state.finish_poll_run(run_id, status, successes=successes, failures=failures)
+            status = "succeeded" if failures == 0 and successes > 0 and incomplete_topologies == 0 else "partial" if successes > 0 else "failed"
+            state.finish_poll_run(
+                run_id, status, successes=successes, failures=failures,
+                error=f"{incomplete_topologies} incomplete topology collection(s)" if incomplete_topologies else "",
+            )
         if last_result is not None:
             last_result["snapshot"] = state.snapshot()
         return last_result or {
