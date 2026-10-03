@@ -768,6 +768,14 @@ body:not(.presentation-mode) .presentation-shell {
   text-transform: none;
 }
 
+.dashboard-seed-button {
+  text-align: center;
+}
+
+.dashboard-seed-button:hover span {
+  transform: none;
+}
+
 .dashboard-action-button::before {
   content: "";
   position: absolute;
