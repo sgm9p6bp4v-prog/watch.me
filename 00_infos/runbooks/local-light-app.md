@@ -9,6 +9,12 @@ Voraussetzung ist eine bereits freigegebene und eingerichtete Python-Umgebung.
   --host 127.0.0.1 --port 5173
 ```
 
+In einem zweiten Terminal den automatischen Poller starten:
+
+```bash
+.venv/bin/python -m netwatch_light.poller
+```
+
 `scripts/run_light_app.sh` installiert fehlende Dependencies und darf deshalb
 nur nach Install-/Download-Freigabe verwendet werden.
 
@@ -19,8 +25,10 @@ curl -sf http://127.0.0.1:5173/api/health
 curl -sf http://127.0.0.1:5173/api/snapshot >/dev/null
 ```
 
-Danach die UI unter `http://127.0.0.1:5173/` oeffnen und einen manuellen Poll
-ausloesen.
+Danach die UI unter `http://127.0.0.1:5173/` oeffnen. Der Poller aktualisiert
+Portstatus, Zaehler und Traffic automatisch alle 30 Sekunden. Der vollstaendige
+SNMP-Inventarlauf fuer LLDP, VLANs, FDB, ARP und Topologie folgt alle 15 Minuten;
+eine manuell angeforderte Discovery startet ihn sofort.
 
 ## State und Security
 

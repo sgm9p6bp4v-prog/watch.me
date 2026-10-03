@@ -25,7 +25,10 @@ Browser UI in web/
 Mock-Inventar, echte SNMP-Seeds und SMC-Chassis teilen denselben State. Der
 separate Poller liest beide gespeicherten Quelltypen. SMC-NICs werden per MAC
 mit LLDP-Kandidaten zusammengefuehrt; die Verkehrszaehler stammen weiterhin von
-der passenden Switch-Port-Schnittstelle.
+der passenden Switch-Port-Schnittstelle. Der Poller aktualisiert Portstatus,
+Zaehler und Traffic automatisch alle 30 Sekunden. LLDP, VLANs, FDB, ARP und die
+vollstaendige Topologie werden alle 15 Minuten oder bei einer manuellen
+Discovery neu eingelesen. Zyklen ueberlappen sich nicht.
 
 ## Setup
 

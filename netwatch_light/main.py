@@ -146,7 +146,7 @@ async def poll_runs(response: Response) -> dict[str, Any]:
 @app.get("/api/devices/{device_id}/history")
 async def device_history(device_id: str, response: Response) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    state.reload()
+    state.reload(include_history=True)
     result = state.get_device_history(device_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Device not found")

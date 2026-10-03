@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Awaitable, Callable
 
 from .smc import SmcSourceConfig, discover_smc, smc_config_from_record
-from .snmp_live import SnmpSeedConfig, discover_seed
+from .snmp_live import SnmpSeedConfig, discover_seed, discover_seed_metrics
 from .state import NetWatchState
 
 PublishCallback = Callable[[dict[str, Any]], Awaitable[None]]
+SOURCE_DISCOVERY_CONCURRENCY = 8
+METRIC_POLL_CONCURRENCY = 4
 
 
 def seed_key(config: SnmpSeedConfig) -> str:
@@ -119,45 +122,169 @@ async def poll_live_seeds(
     failures = 0
     last_result: dict[str, Any] | None = None
     try:
-        for key, config in list(configs.items()):
-            try:
-                discovery = await discover_seed(config, labeled_macs=set(state.mac_labels))
-            except Exception as exc:
-                failures += 1
-                last_result = state.mark_live_poll_failed(str(exc), key)
-                if publish:
-                    await publish({"type": "poll.failed", "event": last_result["event"], "seed": key})
-                continue
-            successes += 1
-            state.register_live_seed(seed_metadata(config, discovery))
-            last_result = state.import_live_discovery(discovery, key)
-            if publish:
-                await publish({"type": "poll.completed", "event": last_result["event"], "seed": key})
+        semaphore = asyncio.Semaphore(SOURCE_DISCOVERY_CONCURRENCY)
 
-        for key, config in list(smc_configs.items()):
-            try:
-                discovery = await discover_smc(config)
-            except Exception as exc:
-                failures += 1
-                last_result = state.mark_smc_poll_failed(key, str(exc))
-                if publish:
-                    await publish({"type": "poll.failed", "event": last_result["event"], "smc": key})
-                continue
-            successes += 1
-            state.register_smc_source(discovery["source"])
-            last_result = state.import_smc_discovery(discovery, key)
-            if publish:
-                await publish({"type": "poll.completed", "event": last_result["event"], "smc": key})
+        async def discover_snmp(key: str, config: SnmpSeedConfig) -> dict[str, Any]:
+            async with semaphore:
+                try:
+                    discovery = await discover_seed(config, labeled_macs=set(state.mac_labels))
+                    return {"kind": "snmp", "key": key, "config": config, "discovery": discovery}
+                except Exception as exc:
+                    return {"kind": "snmp", "key": key, "config": config, "error": exc}
 
-        if len(configs) + len(smc_configs) > 1:
-            event = state.add_event(f"Live {source} finished: {successes} source(s) ok, {failures} failed")
-            last_result = {"event": event, "snapshot": state.snapshot(), "successes": successes, "failures": failures}
+        async def discover_smc_source(key: str, config: SmcSourceConfig) -> dict[str, Any]:
+            async with semaphore:
+                try:
+                    discovery = await discover_smc(config)
+                    return {"kind": "smc", "key": key, "config": config, "discovery": discovery}
+                except Exception as exc:
+                    return {"kind": "smc", "key": key, "config": config, "error": exc}
 
-        status = "succeeded" if failures == 0 and successes > 0 else "partial" if successes > 0 else "failed"
+        discoveries = await asyncio.gather(
+            *(discover_snmp(key, config) for key, config in list(configs.items())),
+            *(discover_smc_source(key, config) for key, config in list(smc_configs.items())),
+        )
+
         state.reload()
-        state.finish_poll_run(run_id, status, successes=successes, failures=failures)
+        with state.deferred_persistence():
+            for item in discoveries:
+                key = item["key"]
+                error = item.get("error")
+                if item["kind"] == "snmp":
+                    config = item["config"]
+                    if error is not None:
+                        failures += 1
+                        last_result = state.mark_live_poll_failed(str(error), key)
+                        if publish:
+                            await publish({"type": "poll.failed", "event": last_result["event"], "seed": key})
+                        continue
+                    discovery = item["discovery"]
+                    successes += 1
+                    state.register_live_seed(seed_metadata(config, discovery))
+                    last_result = state.import_live_discovery(discovery, key, record_history=False)
+                    if publish:
+                        await publish({"type": "poll.completed", "event": last_result["event"], "seed": key})
+                    continue
+
+                if error is not None:
+                    failures += 1
+                    last_result = state.mark_smc_poll_failed(key, str(error))
+                    if publish:
+                        await publish({"type": "poll.failed", "event": last_result["event"], "smc": key})
+                    continue
+                discovery = item["discovery"]
+                successes += 1
+                state.register_smc_source(discovery["source"])
+                last_result = state.import_smc_discovery(discovery, key, record_history=False)
+                if publish:
+                    await publish({"type": "poll.completed", "event": last_result["event"], "smc": key})
+
+            state.record_interface_history()
+            if len(configs) + len(smc_configs) > 1:
+                event = state.add_event(f"Live {source} finished: {successes} source(s) ok, {failures} failed")
+                last_result = {"event": event, "snapshot": state.snapshot(), "successes": successes, "failures": failures}
+
+            status = "succeeded" if failures == 0 and successes > 0 else "partial" if successes > 0 else "failed"
+            state.finish_poll_run(run_id, status, successes=successes, failures=failures)
+        if last_result is not None:
+            last_result["snapshot"] = state.snapshot()
         return last_result or {
             "event": state.add_event("Live poll skipped: no seeds configured"),
+            "snapshot": state.snapshot(),
+            "successes": successes,
+            "failures": failures,
+        }
+    except Exception as exc:
+        state.reload()
+        state.finish_poll_run(run_id, "failed", successes=successes, failures=failures, error=str(exc))
+        raise
+
+
+async def poll_live_metrics(
+    state: NetWatchState,
+    source: str,
+    seed_configs: dict[str, SnmpSeedConfig] | None = None,
+    publish: PublishCallback | None = None,
+) -> dict[str, Any]:
+    state.reload()
+    configs = seed_configs if seed_configs is not None else load_seed_configs(state)
+    if seed_configs is not None and not configs and state.seed_credentials:
+        configs = load_seed_configs(state, seed_configs)
+    smc_configs = load_smc_configs(state)
+    source_count = len(configs) + len(smc_configs)
+    run_id = state.start_poll_run(source, seed_count=source_count)
+    if source_count == 0:
+        state.finish_poll_run(run_id, "skipped", successes=0, failures=0)
+        return {"event": None, "snapshot": state.snapshot(), "successes": 0, "failures": 0}
+
+    semaphore = asyncio.Semaphore(METRIC_POLL_CONCURRENCY)
+
+    async def read_snmp(key: str, config: SnmpSeedConfig) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                return {"kind": "snmp", "key": key, "metrics": await discover_seed_metrics(config)}
+            except Exception as exc:
+                return {"kind": "snmp", "key": key, "error": exc}
+
+    async def read_smc(key: str, config: SmcSourceConfig) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                return {"kind": "smc", "key": key, "discovery": await discover_smc(config)}
+            except Exception as exc:
+                return {"kind": "smc", "key": key, "error": exc}
+
+    successes = 0
+    failures = 0
+    try:
+        readings = await asyncio.gather(
+            *(read_snmp(key, config) for key, config in list(configs.items())),
+            *(read_smc(key, config) for key, config in list(smc_configs.items())),
+        )
+        state.reload()
+        with state.deferred_persistence():
+            for item in readings:
+                key = item["key"]
+                error = item.get("error")
+                if error is not None:
+                    failures += 1
+                    if item["kind"] == "snmp":
+                        result = state.mark_live_poll_failed(str(error), key)
+                    else:
+                        result = state.mark_smc_poll_failed(key, str(error))
+                    if publish:
+                        await publish({"type": "poll.failed", "event": result["event"], "source": key})
+                    continue
+
+                try:
+                    if item["kind"] == "snmp":
+                        result = state.import_live_metrics(item["metrics"], key)
+                    else:
+                        discovery = item["discovery"]
+                        state.register_smc_source(discovery["source"])
+                        result = state.import_smc_discovery(
+                            discovery,
+                            key,
+                            record_event=False,
+                            record_history=False,
+                        )
+                except Exception as exc:
+                    failures += 1
+                    if item["kind"] == "snmp":
+                        result = state.mark_live_poll_failed(str(exc), key)
+                    else:
+                        result = state.mark_smc_poll_failed(key, str(exc))
+                    if publish:
+                        await publish({"type": "poll.failed", "event": result["event"], "source": key})
+                    continue
+                successes += 1
+                if publish and result.get("event"):
+                    await publish({"type": "poll.completed", "event": result["event"], "source": key})
+
+            state.record_interface_history()
+            status = "succeeded" if failures == 0 and successes > 0 else "partial" if successes > 0 else "failed"
+            state.finish_poll_run(run_id, status, successes=successes, failures=failures)
+        return {
+            "event": None,
             "snapshot": state.snapshot(),
             "successes": successes,
             "failures": failures,

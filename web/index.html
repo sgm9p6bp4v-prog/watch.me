@@ -52,14 +52,8 @@
 
       <section class="dashboard-showcase" id="presentationDashboard" aria-label="Network dashboard">
         <div class="dashboard-action-row" aria-label="Dashboard actions">
-          <button class="dashboard-action-button dashboard-run-poll" id="presentationRunPoll" type="button">
-            <span>Run Poll</span>
-          </button>
           <button class="dashboard-action-button dashboard-seed-button" id="presentationSetupButton" type="button">
-            <span>SNMP Seed</span>
-          </button>
-          <button class="dashboard-action-button dashboard-smc-button" id="presentationSmcButton" type="button">
-            <span>SMC Host</span>
+            <span>ADD</span>
           </button>
           <button class="dashboard-action-button dashboard-clear-button" id="presentationClearAllButton" type="button">
             <span>Clear All</span>
@@ -187,14 +181,6 @@
                 <option value="NONE">None</option>
               </select>
             </label>
-            <label>
-              <span>Poll seconds</span>
-              <input id="presentationPollInterval" type="number" min="5" max="3600" value="30" />
-            </label>
-            <label class="seed-toggle presentation-seed-toggle">
-              <input id="presentationBackendPollToggle" type="checkbox" checked />
-              <span>Backend auto poll</span>
-            </label>
             <div class="seed-actions">
               <button class="ghost-button" type="button" id="presentationClearLiveButton">Clear live data</button>
               <button class="primary-button" type="submit" id="presentationSeedSubmitButton">Test and import seed</button>
@@ -229,11 +215,29 @@
           <p class="seed-result" id="presentationSmcResult">No SMC host imported in this browser session.</p>
         </section>
       </div>
+
+      <div class="live-setup-modal" id="clearAllModal" hidden>
+        <button class="live-setup-backdrop" id="clearAllBackdrop" type="button" aria-label="Cancel clear all"></button>
+        <section class="live-setup-card" role="alertdialog" aria-modal="true" aria-labelledby="clearAllTitle" aria-describedby="clearAllDescription">
+          <header class="live-setup-head">
+            <div>
+              <span>Permanent action</span>
+              <h2 id="clearAllTitle">Clear all devices?</h2>
+            </div>
+            <button class="live-setup-close" id="clearAllClose" type="button" aria-label="Cancel clear all">×</button>
+          </header>
+          <p id="clearAllDescription">This removes every SNMP seed, SMC host, discovered device, saved credential and topology link.</p>
+          <div class="seed-actions">
+            <button class="ghost-button" id="clearAllCancelButton" type="button">Cancel</button>
+            <button class="primary-button" id="clearAllConfirmButton" type="button">Clear all</button>
+          </div>
+        </section>
+      </div>
     </div>
 
     <span id="backendState" hidden>Connecting</span>
     <span id="eventStreamState" hidden>WebSocket pending</span>
 
-    <script src="/assets/app.js?v=smc-integration-1" type="module"></script>
+    <script src="/assets/app.js?v=automatic-polling-1" type="module"></script>
   </body>
 </html>

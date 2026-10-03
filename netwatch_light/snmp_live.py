@@ -51,6 +51,19 @@ TABLE_OIDS = {
     "if_alias": "1.3.6.1.2.1.31.1.1.1.18",
 }
 
+FAST_TABLE_OIDS = {
+    "if_admin_status": "1.3.6.1.2.1.2.2.1.7",
+    "if_oper_status": "1.3.6.1.2.1.2.2.1.8",
+    "if_in_octets": "1.3.6.1.2.1.2.2.1.10",
+    "if_in_discards": "1.3.6.1.2.1.2.2.1.13",
+    "if_in_errors": "1.3.6.1.2.1.2.2.1.14",
+    "if_out_octets": "1.3.6.1.2.1.2.2.1.16",
+    "if_out_discards": "1.3.6.1.2.1.2.2.1.19",
+    "if_out_errors": "1.3.6.1.2.1.2.2.1.20",
+    "if_hc_in_octets": "1.3.6.1.2.1.31.1.1.1.6",
+    "if_hc_out_octets": "1.3.6.1.2.1.31.1.1.1.10",
+}
+
 LLDP_OIDS = {
     "remote_chassis_id_subtype": "1.0.8802.1.1.2.1.4.1.1.4",
     "remote_chassis_id": "1.0.8802.1.1.2.1.4.1.1.5",
@@ -333,12 +346,18 @@ async def _get_system(config: SnmpSeedConfig) -> dict[str, str]:
     return {key: _text(var_binds[index][1]) for index, key in enumerate(SYSTEM_OIDS)}
 
 
-async def _walk_table(config: SnmpSeedConfig, base_oid: str, max_rows: int | None = None) -> dict[str, Any]:
+async def _walk_table(
+    config: SnmpSeedConfig,
+    base_oid: str,
+    max_rows: int | None = None,
+    snmp_engine: SnmpEngine | None = None,
+    transport_target: UdpTransportTarget | None = None,
+) -> dict[str, Any]:
     rows: dict[str, Any] = {}
     async for error_indication, error_status, error_index, var_binds in bulk_walk_cmd(
-        SnmpEngine(),
+        snmp_engine or SnmpEngine(),
         _auth_data(config),
-        await _target(config),
+        transport_target or await _target(config),
         ContextData(),
         0,
         25,
@@ -364,6 +383,28 @@ async def _walk_many(config: SnmpSeedConfig, tables: dict[str, str]) -> dict[str
     for name, oid in tables.items():
         results[name] = await _walk_table(config, oid)
     return results
+
+
+async def _walk_many_bounded(
+    config: SnmpSeedConfig,
+    tables: dict[str, str],
+    concurrency: int = 4,
+) -> dict[str, dict[str, Any]]:
+    semaphore = asyncio.Semaphore(concurrency)
+    snmp_engine = SnmpEngine()
+    transport_target = await _target(config)
+
+    async def walk_item(name: str, oid: str) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            return name, await _walk_table(
+                config,
+                oid,
+                snmp_engine=snmp_engine,
+                transport_target=transport_target,
+            )
+
+    pairs = await asyncio.gather(*(walk_item(name, oid) for name, oid in tables.items()))
+    return dict(pairs)
 
 
 async def _walk_optional_table(config: SnmpSeedConfig, oid: str, max_rows: int = 768) -> dict[str, Any]:
@@ -671,6 +712,36 @@ def _vendor_from_mac(mac: str) -> str:
         "28e9a4": "Siemens",
     }
     return vendors.get(oui, "unknown")
+
+
+async def discover_seed_metrics(config: SnmpSeedConfig) -> dict[str, Any]:
+    tables = await _walk_many_bounded(config, FAST_TABLE_OIDS)
+    indexes = sorted(
+        set().union(*(set(table) for table in tables.values())),
+        key=lambda item: [int(part) if part.isdigit() else part for part in item.split(".")],
+    )
+    interfaces = []
+    for index in indexes:
+        hc_in = tables["if_hc_in_octets"].get(index)
+        hc_out = tables["if_hc_out_octets"].get(index)
+        interfaces.append(
+            {
+                "if_index": index,
+                "admin_status": _status(tables["if_admin_status"], index, ADMIN_STATUS),
+                "oper_status": _status(tables["if_oper_status"], index, OPER_STATUS),
+                "in_octets": _int(hc_in if hc_in is not None else tables["if_in_octets"].get(index)),
+                "out_octets": _int(hc_out if hc_out is not None else tables["if_out_octets"].get(index)),
+                "in_errors": _int(tables["if_in_errors"].get(index)),
+                "out_errors": _int(tables["if_out_errors"].get(index)),
+                "in_discards": _int(tables["if_in_discards"].get(index)),
+                "out_discards": _int(tables["if_out_discards"].get(index)),
+            }
+        )
+    return {
+        "system": {},
+        "interfaces": interfaces,
+        "counts": {"interfaces": len(interfaces)},
+    }
 
 
 async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = None) -> dict[str, Any]:

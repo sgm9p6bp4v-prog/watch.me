@@ -12,7 +12,7 @@ This is the first working lightweight version of NetWatch. It is intentionally s
 - One-time migration from the legacy local JSON state file when the database is empty.
 - Local database persistence for SNMP seed credentials in the light build.
 - Multi-seed runtime polling with credentials reloaded after backend restart.
-- Dedicated poller process with configurable interval.
+- Dedicated poller process with 30-second status/traffic polling and a 15-minute inventory cycle.
 - Versioned metric catalog loaded from `config/metric_catalog.yaml`.
 - Structured metric sample persistence for interface status, counters and traffic gauges.
 - Poll run history with status, duration, seed count, successes and failures.
@@ -22,7 +22,7 @@ This is the first working lightweight version of NetWatch. It is intentionally s
 - Device list and device detail.
 - LLDP topology with confirmed and pending links.
 - Alert lifecycle: active, acknowledged, resolved.
-- Manual poll and discovery actions through real API calls.
+- Automatic SNMP and SMC polling plus on-demand discovery through real API calls.
 - WebSocket event stream.
 
 ## What is still mocked
@@ -64,7 +64,7 @@ Start the poller in a second terminal:
 .venv/bin/python -m netwatch_light.poller
 ```
 
-The web server serves the UI/API. The poller reads seed credentials from the same database, performs SNMP polling, and writes refreshed topology, interface samples, alerts and events back to the database.
+The web server serves the UI/API. The poller reads seed credentials from the same database and updates interface status, counters and traffic every 30 seconds without overlapping cycles. LLDP, VLAN, FDB, ARP and topology inventory is refreshed every 15 minutes or on demand. Saved SNMP/SMC sources are queried with bounded concurrency so a larger inventory does not become a long serial queue or overload the server.
 
 The light build now also writes structured metric samples and poll run history into the local database. This is not a full TimescaleDB deployment yet, but it keeps metric names, labels and poller state explicit enough to migrate cleanly later.
 

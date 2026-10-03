@@ -6,7 +6,7 @@ const TOPOLOGY_MIN_ZOOM = 0.03;
 const appState = {
   selectedView: "home",
   selectedDeviceId: "core-01",
-  autoPollTimer: null,
+  pendingClearResultId: "seedResult",
   topologyPositions: {},
   topologyLayoutSignature: "",
   topologyStructure: null,
@@ -400,7 +400,9 @@ function handlePresentationWheel(event) {
   if (event.ctrlKey || event.metaKey || event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
   if (!event.deltaY || !event.cancelable) return;
   const target = event.target instanceof Element ? event.target : null;
-  const overlayOpen = appState.historyOverlayOpen || document.getElementById("liveSetupModal")?.hidden === false;
+  const overlayOpen = appState.historyOverlayOpen
+    || document.getElementById("liveSetupModal")?.hidden === false
+    || document.getElementById("clearAllModal")?.hidden === false;
   if (overlayOpen || getInternalScrollTarget(target, event.deltaY)) {
     cancelPresentationScroll();
     if (overlayOpen && !getInternalScrollTarget(target, event.deltaY)) event.preventDefault();
@@ -610,28 +612,6 @@ function getSeedSummaryText() {
 function updateSeedSummary() {
   const summary = document.getElementById("presentationSeedSummary");
   if (summary) summary.textContent = getSeedSummaryText();
-}
-
-function updatePollActionButtons(isBusy = false) {
-  const polling = getPollingSettings();
-  const enabled = Boolean(polling.backend_auto_poll);
-  const interval = Number(polling.backend_interval_seconds || 30);
-  const label = enabled ? "Stop Poll" : "Run Poll";
-  const title = enabled ? `Polling every ${interval}s` : "Start polling every 30 seconds";
-  ["presentationRunPoll", "runPollButton"].forEach((id) => {
-    const button = document.getElementById(id);
-    if (!button) return;
-    button.disabled = isBusy;
-    button.classList.toggle("is-running", enabled);
-    button.setAttribute("aria-pressed", String(enabled));
-    button.title = isBusy ? "Polling in progress" : title;
-    const labelTarget = button.querySelector("span");
-    if (labelTarget) {
-      labelTarget.textContent = label;
-    } else {
-      button.textContent = label;
-    }
-  });
 }
 
 function formatAge(seconds) {
@@ -1016,7 +996,6 @@ function renderPresentationDashboard() {
     .map((event) => `<li><time>${escapeHtml(event.time)}</time> - ${escapeHtml(event.text)}</li>`)
     .join("");
   updateSeedSummary();
-  updatePollActionButtons();
 }
 
 function getDeviceSummary(device) {
@@ -3304,16 +3283,7 @@ function renderSettings() {
     liveModeBadge.textContent = `${appState.snapshot.mode || "mock"} mode`;
     liveModeBadge.className = `status-pill ${appState.snapshot.mode === "live" ? "up" : "neutral"}`;
   }
-  const backendPoll = Boolean(polling.backend_auto_poll);
-  const interval = Number(polling.backend_interval_seconds || 30);
-  const legacyToggle = document.getElementById("autoPollToggle");
-  const presentationToggle = document.getElementById("presentationBackendPollToggle");
-  const presentationInterval = document.getElementById("presentationPollInterval");
-  if (legacyToggle) legacyToggle.checked = backendPoll;
-  if (presentationToggle) presentationToggle.checked = backendPoll;
-  if (presentationInterval) presentationInterval.value = String(interval);
   updateSeedSummary();
-  updatePollActionButtons();
   syncSeedVersionFields();
 }
 
@@ -3351,29 +3321,6 @@ function switchView(view, behavior = "smooth") {
   enterPresentationMode("dashboard", behavior);
 }
 
-async function runPoll() {
-  const result = await apiPost("/api/poll");
-  appState.snapshot = result.snapshot;
-  renderAll();
-}
-
-async function toggleBackendPoll() {
-  const polling = getPollingSettings();
-  const enabled = Boolean(polling.backend_auto_poll);
-  const interval = Number(polling.backend_interval_seconds || 30) || 30;
-  updatePollActionButtons(true);
-  try {
-    if (enabled) {
-      await setBackendPolling(false, interval);
-      return;
-    }
-    await runPoll();
-    await setBackendPolling(true, 30);
-  } finally {
-    updatePollActionButtons(false);
-  }
-}
-
 async function runDiscovery() {
   const result = await apiPost("/api/discovery");
   appState.snapshot = result.snapshot;
@@ -3382,7 +3329,6 @@ async function runDiscovery() {
 }
 
 async function clearLiveInventory(resultId = "seedResult") {
-  stopAutoPoll();
   const result = await apiPost("/api/live/clear");
   appState.snapshot = result.snapshot;
   appState.selectedDeviceId = "";
@@ -3394,14 +3340,26 @@ async function clearLiveInventory(resultId = "seedResult") {
   renderAll();
 }
 
-async function setBackendPolling(enabled, intervalSeconds = 30) {
-  const result = await apiPostJson("/api/polling", {
-    enabled,
-    interval_seconds: Number(intervalSeconds || 30)
-  });
-  appState.snapshot = result.snapshot;
-  renderAll();
-  return result;
+function setClearAllConfirmationOpen(open, resultId = "seedResult") {
+  const modal = document.getElementById("clearAllModal");
+  if (!modal) return;
+  appState.pendingClearResultId = resultId;
+  modal.hidden = !open;
+  if (open) {
+    cancelPresentationScroll();
+    document.getElementById("clearAllCancelButton")?.focus();
+  }
+}
+
+async function confirmClearLiveInventory() {
+  const confirmButton = document.getElementById("clearAllConfirmButton");
+  if (confirmButton) confirmButton.disabled = true;
+  try {
+    await clearLiveInventory(appState.pendingClearResultId);
+    setClearAllConfirmationOpen(false);
+  } finally {
+    if (confirmButton) confirmButton.disabled = false;
+  }
 }
 
 async function submitSeed(event) {
@@ -3431,10 +3389,9 @@ async function submitSeed(event) {
       resultEl.className = "seed-result error";
       resultEl.textContent = `SNMP system works, but IF-MIB returned 0 interfaces. Check that the read-only view includes IF-MIB/ifTable/ifXTable.`;
     } else {
-      resultEl.textContent = `Imported ${result.system.sys_name || payload.host}: ${result.counts.interfaces} interfaces, ${result.counts.lldp_candidates} LLDP candidates. Run poll again to calculate bps rates.`;
+      resultEl.textContent = `Imported ${result.system.sys_name || payload.host}: ${result.counts.interfaces} interfaces, ${result.counts.lldp_candidates} LLDP candidates.`;
     }
     renderAll();
-    await setBackendPolling(document.getElementById("autoPollToggle").checked, 30);
     switchView("devices");
   } catch (error) {
     resultEl.className = "seed-result error";
@@ -3471,10 +3428,6 @@ async function submitPresentationSeed(event) {
       ? "SNMP system works, but IF-MIB returned 0 interfaces."
       : `Imported ${result.system.sys_name || payload.host}: ${result.counts.interfaces} interfaces, ${result.counts.lldp_candidates} LLDP candidates.`;
     renderAll();
-    await setBackendPolling(
-      document.getElementById("presentationBackendPollToggle").checked,
-      Number(document.getElementById("presentationPollInterval").value || 30)
-    );
     setLiveSetupOpen(false);
     switchView("devices");
   } catch (error) {
@@ -3505,10 +3458,6 @@ async function submitPresentationSmc(event) {
     resultEl.className = "seed-result success";
     resultEl.textContent = `Imported ${result.machine.hostname || payload.host}: ${result.counts.interfaces} NICs, ${result.counts.hardware_stats} chassis readings, ${result.counts.vfcs} VFCs.`;
     renderAll();
-    await setBackendPolling(
-      document.getElementById("presentationBackendPollToggle").checked,
-      Number(document.getElementById("presentationPollInterval").value || 30)
-    );
     setLiveSetupOpen(false);
     switchView("devices");
   } catch (error) {
@@ -3516,28 +3465,6 @@ async function submitPresentationSmc(event) {
     resultEl.textContent = `SMC test failed: ${error.message}`;
   } finally {
     submit.disabled = false;
-  }
-}
-
-function startAutoPoll() {
-  stopAutoPoll();
-  const toggle = document.getElementById("autoPollToggle");
-  if (!toggle || !toggle.checked) return;
-  appState.autoPollTimer = window.setInterval(async () => {
-    if ((appState.snapshot.mode || "mock") !== "live") return;
-    try {
-      await runPoll();
-    } catch (error) {
-      const streamState = document.getElementById("eventStreamState");
-      if (streamState) streamState.textContent = `Poll failed: ${error.message}`;
-    }
-  }, 30000);
-}
-
-function stopAutoPoll() {
-  if (appState.autoPollTimer) {
-    window.clearInterval(appState.autoPollTimer);
-    appState.autoPollTimer = null;
   }
 }
 
@@ -3596,9 +3523,7 @@ function bindEvents() {
   document.querySelectorAll("[data-view-target]").forEach((item) => {
     item.addEventListener("click", () => switchView(item.dataset.viewTarget));
   });
-  document.getElementById("runPollButton")?.addEventListener("click", toggleBackendPoll);
   document.getElementById("runDiscoveryButton")?.addEventListener("click", runDiscovery);
-  document.getElementById("presentationRunPoll")?.addEventListener("click", toggleBackendPoll);
   document.getElementById("showcaseZoomIn")?.addEventListener("click", () => setShowcaseZoom(getAppliedShowcaseZoom() + 0.14));
   document.getElementById("showcaseZoomOut")?.addEventListener("click", () => setShowcaseZoom(getAppliedShowcaseZoom() - 0.14));
   document.getElementById("showcaseCleanUp")?.addEventListener("click", cleanUpShowcaseTopology);
@@ -3608,32 +3533,21 @@ function bindEvents() {
     button.addEventListener("click", () => setMonitorViewMode(button.dataset.monitorView));
   });
   document.getElementById("historyBackButton")?.addEventListener("click", () => setHistoryOverlayOpen(false));
-  document.getElementById("presentationSetupButton")?.addEventListener("click", () => setLiveSetupOpen(true, "seed"));
-  document.getElementById("presentationSmcButton")?.addEventListener("click", () => setLiveSetupOpen(true, "smc"));
-  document.getElementById("presentationClearAllButton")?.addEventListener("click", () => clearLiveInventory());
+  document.getElementById("presentationSetupButton")?.addEventListener("click", () => setLiveSetupOpen(true));
+  document.getElementById("presentationClearAllButton")?.addEventListener("click", () => setClearAllConfirmationOpen(true));
   document.getElementById("liveSetupClose")?.addEventListener("click", () => setLiveSetupOpen(false));
   document.getElementById("liveSetupBackdrop")?.addEventListener("click", () => setLiveSetupOpen(false));
-  document.getElementById("presentationClearLiveButton")?.addEventListener("click", () => clearLiveInventory("presentationSeedResult"));
+  document.getElementById("presentationClearLiveButton")?.addEventListener("click", () => setClearAllConfirmationOpen(true, "presentationSeedResult"));
+  document.getElementById("clearAllBackdrop")?.addEventListener("click", () => setClearAllConfirmationOpen(false));
+  document.getElementById("clearAllClose")?.addEventListener("click", () => setClearAllConfirmationOpen(false));
+  document.getElementById("clearAllCancelButton")?.addEventListener("click", () => setClearAllConfirmationOpen(false));
+  document.getElementById("clearAllConfirmButton")?.addEventListener("click", confirmClearLiveInventory);
   document.getElementById("presentationSeedForm")?.addEventListener("submit", submitPresentationSeed);
   document.getElementById("presentationSmcForm")?.addEventListener("submit", submitPresentationSmc);
   document.getElementById("presentationSeedVersion")?.addEventListener("change", syncSeedVersionFields);
-  document.getElementById("presentationBackendPollToggle")?.addEventListener("change", async () => {
-    await setBackendPolling(
-      document.getElementById("presentationBackendPollToggle").checked,
-      Number(document.getElementById("presentationPollInterval").value || 30)
-    );
-  });
-  document.getElementById("presentationPollInterval")?.addEventListener("change", async () => {
-    if (document.getElementById("presentationBackendPollToggle").checked) {
-      await setBackendPolling(true, Number(document.getElementById("presentationPollInterval").value || 30));
-    }
-  });
-  document.getElementById("clearLiveButton")?.addEventListener("click", () => clearLiveInventory("seedResult"));
+  document.getElementById("clearLiveButton")?.addEventListener("click", () => setClearAllConfirmationOpen(true, "seedResult"));
   document.getElementById("seedForm")?.addEventListener("submit", submitSeed);
   document.getElementById("seedVersion")?.addEventListener("change", syncSeedVersionFields);
-  document.getElementById("autoPollToggle")?.addEventListener("change", async () => {
-    await setBackendPolling(document.getElementById("autoPollToggle").checked, 30);
-  });
   window.addEventListener("resize", () => {
     cancelPresentationScroll();
     presentationLayout = null;
@@ -3677,8 +3591,14 @@ function bindEvents() {
     if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End", " "].includes(event.key)) {
       cancelPresentationScroll();
     }
-    if (event.key === "Escape" && appState.historyOverlayOpen) {
-      setHistoryOverlayOpen(false);
+    if (event.key === "Escape") {
+      if (document.getElementById("clearAllModal")?.hidden === false) {
+        setClearAllConfirmationOpen(false);
+      } else if (document.getElementById("liveSetupModal")?.hidden === false) {
+        setLiveSetupOpen(false);
+      } else if (appState.historyOverlayOpen) {
+        setHistoryOverlayOpen(false);
+      }
     }
   });
 }

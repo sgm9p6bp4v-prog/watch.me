@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 
+from netwatch_light import polling, snmp_live
 from netwatch_light.smc import SmcSourceConfig, discover_smc
+from netwatch_light.snmp_live import SnmpSeedConfig
 from netwatch_light.state import NetWatchState
 
 
@@ -183,3 +185,246 @@ def test_smc_controller_ip_does_not_absorb_an_unrelated_endpoint():
 
     assert state._deduplicate_observed_topology() is False
     assert {device["id"] for device in state.devices} == {"smc-26545", "endpoint-unrelated"}
+
+
+def test_polling_policy_stays_automatic_at_thirty_seconds():
+    state = NetWatchState()
+
+    result = state.set_backend_polling(False, 900)
+    polling_settings = result["snapshot"]["settings"]["polling"]
+
+    assert polling_settings["backend_auto_poll"] is True
+    assert polling_settings["backend_interval_seconds"] == 30
+
+
+def test_deferred_persistence_collapses_repeated_writes():
+    state = NetWatchState()
+    writes = []
+
+    class RecordingStore:
+        def save_payload(self, payload):
+            writes.append(payload)
+
+    state.store = RecordingStore()
+    with state.deferred_persistence():
+        state.persist()
+        state.persist()
+        state.persist()
+
+    assert len(writes) == 1
+
+
+def test_poll_runtime_and_run_survive_unrelated_snapshot_writes(tmp_path, monkeypatch):
+    monkeypatch.setenv("NETWATCH_MASTER_KEY", "poll-runtime-test-key")
+    db_url = f"sqlite:///{tmp_path / 'netwatch.db'}"
+    state = NetWatchState(tmp_path / "state.json", db_url)
+    state.persist()
+
+    run_id = state.start_poll_run("scheduled poll", seed_count=3)
+    state.update_external_poller_status("polling", pid=4321)
+
+    unrelated_writer = NetWatchState(tmp_path / "state.json", db_url)
+    unrelated_writer.events.insert(0, {"id": "ui-write", "time": "12:00:00", "text": "UI state saved"})
+    unrelated_writer.persist()
+
+    reloaded = NetWatchState(tmp_path / "state.json", db_url)
+    active_run = next(run for run in reloaded.poll_runs if run["id"] == run_id)
+    assert active_run["source"] == "scheduled poll"
+    assert active_run["status"] == "running"
+    assert reloaded.settings["polling"]["external_poller_status"] == "polling"
+    assert reloaded.settings["polling"]["external_poller_pid"] == 4321
+
+    reloaded.finish_poll_run(run_id, "succeeded", successes=3)
+    final_state = NetWatchState(tmp_path / "state.json", db_url)
+    finished_run = next(run for run in final_state.poll_runs if run["id"] == run_id)
+    assert finished_run["status"] == "succeeded"
+    assert finished_run["duration_ms"] is not None
+
+
+def test_interrupted_poll_runs_are_closed_on_poller_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("NETWATCH_MASTER_KEY", "poll-recovery-test-key")
+    db_url = f"sqlite:///{tmp_path / 'netwatch.db'}"
+    state = NetWatchState(tmp_path / "state.json", db_url)
+    state.persist()
+    run_id = state.start_poll_run("scheduled metrics", seed_count=2)
+
+    restarted = NetWatchState(tmp_path / "state.json", db_url, load_history=False)
+    assert restarted.recover_interrupted_poll_runs() == 1
+
+    final_state = NetWatchState(tmp_path / "state.json", db_url, load_history=False)
+    recovered = next(run for run in final_state.poll_runs if run["id"] == run_id)
+    assert recovered["status"] == "failed"
+    assert recovered["finished_at"]
+    assert recovered["error"] == "poller stopped before this cycle completed"
+
+
+def test_poll_cycle_discovers_multiple_sources_concurrently(monkeypatch):
+    state = NetWatchState()
+    state.smc_sources = []
+    active = 0
+    peak = 0
+
+    async def fake_discover(config, labeled_macs=None):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"system": {"sys_name": config.host}, "counts": {}}
+
+    monkeypatch.setattr(polling, "discover_seed", fake_discover)
+    monkeypatch.setattr(state, "reload", lambda: None)
+    monkeypatch.setattr(state, "start_poll_run", lambda source, seed_count=0: "run-1")
+    monkeypatch.setattr(state, "finish_poll_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(state, "register_live_seed", lambda metadata: None)
+    monkeypatch.setattr(
+        state,
+        "import_live_discovery",
+        lambda discovery, key, **kwargs: {"event": {"id": key}, "snapshot": {}},
+    )
+    monkeypatch.setattr(state, "add_event", lambda text: {"text": text})
+    monkeypatch.setattr(state, "snapshot", lambda: {})
+    configs = {
+        f"10.0.0.{index}:161": SnmpSeedConfig(f"10.0.0.{index}", community="test")
+        for index in range(1, 4)
+    }
+
+    result = asyncio.run(polling.poll_live_seeds(state, "test", configs))
+
+    assert peak > 1
+    assert result["successes"] == 3
+
+
+def test_fast_snmp_discovery_uses_hc_counters_with_32_bit_fallback(monkeypatch):
+    async def fake_walk_tables(config, tables, concurrency=4):
+        return {
+            "if_admin_status": {"1": 1, "2": 1},
+            "if_oper_status": {"1": 1, "2": 2},
+            "if_in_octets": {"1": 100, "2": 200},
+            "if_out_octets": {"1": 300, "2": 400},
+            "if_hc_in_octets": {"1": 1_000},
+            "if_hc_out_octets": {"1": 3_000},
+            "if_in_discards": {},
+            "if_in_errors": {},
+            "if_out_discards": {},
+            "if_out_errors": {},
+        }
+
+    monkeypatch.setattr(snmp_live, "_walk_many_bounded", fake_walk_tables)
+
+    metrics = asyncio.run(snmp_live.discover_seed_metrics(SnmpSeedConfig("10.0.0.1", community="test")))
+    interfaces = {interface["if_index"]: interface for interface in metrics["interfaces"]}
+
+    assert interfaces["1"]["in_octets"] == 1_000
+    assert interfaces["1"]["out_octets"] == 3_000
+    assert interfaces["2"]["in_octets"] == 200
+    assert interfaces["2"]["out_octets"] == 400
+    assert interfaces["2"]["oper_status"] == "down"
+
+
+def test_fast_metrics_update_existing_inventory_without_replacing_it():
+    state = NetWatchState()
+    state.devices = [
+        {
+            "id": "switch-1",
+            "name": "Switch 1",
+            "status": "unknown",
+            "device_type": "switch",
+            "seed_key": "10.0.0.1:161",
+            "interfaces": [
+                {
+                    "id": "switch-1-if-1",
+                    "if_index": "1",
+                    "name": "Ethernet 1",
+                    "if_alias": "uplink",
+                    "admin_status": "up",
+                    "oper_status": "unknown",
+                    "in_octets": 100,
+                    "out_octets": 200,
+                    "in_bps": None,
+                    "out_bps": None,
+                }
+            ],
+        }
+    ]
+    state.seeds = [{
+        "key": "10.0.0.1:161",
+        "status": "unknown",
+        "last_error": "timeout",
+        "last_counts": {"lldp_candidates": 2, "interfaces": 1},
+    }]
+    state.links = []
+    first = {
+        "interfaces": [
+            {
+                "if_index": "1",
+                "admin_status": "up",
+                "oper_status": "up",
+                "in_octets": 200,
+                "out_octets": 300,
+                "in_errors": 0,
+                "out_errors": 0,
+                "in_discards": 0,
+                "out_discards": 0,
+            }
+        ],
+        "counts": {"interfaces": 1},
+    }
+    second = {
+        **first,
+        "interfaces": [{**first["interfaces"][0], "in_octets": 400, "out_octets": 600}],
+    }
+
+    state.import_live_metrics(first, "10.0.0.1:161")
+    state.record_interface_history()
+    state.import_live_metrics(second, "10.0.0.1:161")
+    state.record_interface_history()
+
+    interface = state.devices[0]["interfaces"][0]
+    assert state.devices[0]["status"] == "up"
+    assert interface["name"] == "Ethernet 1"
+    assert interface["if_alias"] == "uplink"
+    assert interface["oper_status"] == "up"
+    assert interface["in_bps"] is not None
+    assert interface["out_bps"] is not None
+    assert state.seeds[0]["last_error"] == ""
+    assert state.seeds[0]["last_counts"]["lldp_candidates"] == 2
+    assert len(state.interface_history["switch-1::switch-1-if-1"]) == 2
+
+
+def test_database_history_is_incremental_and_not_embedded_in_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setenv("NETWATCH_MASTER_KEY", "history-storage-test-key")
+    db_path = tmp_path / "netwatch.db"
+    state = NetWatchState(tmp_path / "state.json", f"sqlite:///{db_path}")
+    state.devices = [
+        {
+            "id": "switch-1",
+            "name": "Switch 1",
+            "status": "up",
+            "device_type": "switch",
+            "interfaces": [
+                {
+                    "id": "switch-1-if-1",
+                    "if_index": "1",
+                    "name": "Ethernet 1",
+                    "admin_status": "up",
+                    "oper_status": "up",
+                    "in_bps": 100,
+                    "out_bps": 200,
+                }
+            ],
+        }
+    ]
+    state.interface_history = {}
+
+    state.record_interface_history()
+    state.persist()
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("select count(*) from interface_samples").fetchone()[0] == 1
+        assert conn.execute(
+            "select json_type(payload, '$.interface_history') from app_state where key = 'snapshot'"
+        ).fetchone()[0] is None
+
+    reloaded = NetWatchState(tmp_path / "state.json", f"sqlite:///{db_path}")
+    assert len(reloaded.interface_history["switch-1::switch-1-if-1"]) == 1

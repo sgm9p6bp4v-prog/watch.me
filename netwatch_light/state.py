@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
@@ -23,6 +24,7 @@ from .storage import DatabaseStore
 SNAPSHOT_VERSION = 2
 EVENT_CAP = 20
 POLL_RUN_CAP = 100
+AUTO_POLL_INTERVAL_SECONDS = 30
 INTERFACE_HISTORY_SECONDS = 60 * 60
 INTERFACE_HISTORY_CAP = 720
 OBSERVED_MAC_LINK_MISSING_POLL_CAP = 3
@@ -56,7 +58,12 @@ def _nullable_float(value: Any) -> float | None:
 class NetWatchState:
     """State container for the light app, persisted through the configured store."""
 
-    def __init__(self, persistence_path: Path | None = None, database_url: str | None = None) -> None:
+    def __init__(
+        self,
+        persistence_path: Path | None = None,
+        database_url: str | None = None,
+        load_history: bool = True,
+    ) -> None:
         self.persistence_path = persistence_path
         self.store = DatabaseStore(database_url) if database_url else None
         self.storage_backend = "database" if self.store else "json"
@@ -67,6 +74,8 @@ class NetWatchState:
         self.metric_catalog_details = load_metric_catalog()
         self.metric_catalog = metric_catalog_names(self.metric_catalog_details)
         self.poll_runs: list[dict[str, Any]] = []
+        self._persist_defer_depth = 0
+        self._persist_pending = False
         self.devices: list[dict[str, Any]] = [
             {
                 "id": "core-01",
@@ -344,13 +353,13 @@ class NetWatchState:
         self.settings = {
             "polling": {
                 "status_seconds": 30,
-                "traffic_seconds": 60,
+                "traffic_seconds": 30,
                 "inventory_minutes": 15,
                 "global_concurrency": 50,
                 "per_device_concurrency": 2,
                 "getbulk": "adaptive, starts at 25",
-                "backend_auto_poll": False,
-                "backend_interval_seconds": 30,
+                "backend_auto_poll": True,
+                "backend_interval_seconds": AUTO_POLL_INTERVAL_SECONDS,
                 "backend_status": "stopped",
                 "external_poller_status": "unknown",
             },
@@ -366,7 +375,7 @@ class NetWatchState:
         self.smc_sources: list[dict[str, Any]] = []
         self.mac_labels: dict[str, dict[str, Any]] = {}
         self.device_labels: dict[str, dict[str, Any]] = {}
-        self._load()
+        self._load(include_history=load_history)
 
     def _payload(self) -> dict[str, Any]:
         return {
@@ -389,11 +398,11 @@ class NetWatchState:
             "device_labels": self.device_labels,
         }
 
-    def _load(self) -> None:
+    def _load(self, include_history: bool = True) -> None:
         data: dict[str, Any] | None = None
         loaded_from = ""
         if self.store:
-            data = self.store.load_payload()
+            data = self.store.load_payload(include_history=include_history)
             if data is not None:
                 loaded_from = "database"
         if data is None:
@@ -426,8 +435,10 @@ class NetWatchState:
         if isinstance(loaded_settings, dict):
             self.settings.update(loaded_settings)
             self.settings.setdefault("polling", {})
-            self.settings["polling"].setdefault("backend_auto_poll", False)
-            self.settings["polling"].setdefault("backend_interval_seconds", 30)
+            self.settings["polling"]["status_seconds"] = AUTO_POLL_INTERVAL_SECONDS
+            self.settings["polling"]["traffic_seconds"] = AUTO_POLL_INTERVAL_SECONDS
+            self.settings["polling"]["backend_auto_poll"] = True
+            self.settings["polling"]["backend_interval_seconds"] = AUTO_POLL_INTERVAL_SECONDS
             self.settings["polling"].setdefault("backend_status", "stopped")
             self.settings["polling"].setdefault("external_poller_status", "unknown")
             self.settings.setdefault("thresholds", {})
@@ -442,8 +453,8 @@ class NetWatchState:
             for source in data.get("smc_sources", self.smc_sources)
             if isinstance(source, dict) and source.get("key")
         ]
-        loaded_history = data.get("interface_history", {})
-        if isinstance(loaded_history, dict):
+        loaded_history = data.get("interface_history")
+        if "interface_history" in data and isinstance(loaded_history, dict):
             self.interface_history = loaded_history
         loaded_mac_labels = data.get("mac_labels", {})
         if isinstance(loaded_mac_labels, dict):
@@ -470,10 +481,13 @@ class NetWatchState:
         elif self.store and loaded_from == "json":
             self.persist()
 
-    def reload(self) -> None:
-        self._load()
+    def reload(self, include_history: bool = False) -> None:
+        self._load(include_history=include_history)
 
     def persist(self) -> None:
+        if self._persist_defer_depth > 0:
+            self._persist_pending = True
+            return
         if self.store:
             self.store.save_payload(self._payload())
             return
@@ -483,6 +497,17 @@ class NetWatchState:
         tmp_path = self.persistence_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(self._payload(), indent=2), encoding="utf-8")
         tmp_path.replace(self.persistence_path)
+
+    @contextmanager
+    def deferred_persistence(self):
+        self._persist_defer_depth += 1
+        try:
+            yield
+        finally:
+            self._persist_defer_depth -= 1
+            if self._persist_defer_depth == 0 and self._persist_pending:
+                self._persist_pending = False
+                self.persist()
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -832,12 +857,10 @@ class NetWatchState:
 
     def set_backend_polling(self, enabled: bool, interval_seconds: int) -> dict[str, Any]:
         polling = self.settings.setdefault("polling", {})
-        polling["backend_auto_poll"] = enabled
-        polling["backend_interval_seconds"] = interval_seconds
-        polling["backend_status"] = "enabled" if enabled else "stopped"
-        event = self.add_event(
-            f"Backend auto poll {'enabled' if enabled else 'disabled'}: {interval_seconds}s interval"
-        )
+        polling["backend_auto_poll"] = True
+        polling["backend_interval_seconds"] = AUTO_POLL_INTERVAL_SECONDS
+        polling["backend_status"] = "enabled"
+        event = self.add_event(f"Backend auto poll enabled: {AUTO_POLL_INTERVAL_SECONDS}s interval")
         return {"event": event, "snapshot": self.snapshot()}
 
     def start_poll_run(self, source: str, seed_count: int = 0) -> str:
@@ -862,7 +885,10 @@ class NetWatchState:
         polling["current_poll_run_id"] = run_id
         polling["last_poll_run_id"] = run_id
         polling["backend_status"] = "polling"
-        self.persist()
+        if self.store:
+            self.store.save_poll_run(run)
+        else:
+            self.persist()
         return run_id
 
     def finish_poll_run(
@@ -908,7 +934,26 @@ class NetWatchState:
         polling["last_poll_run_status"] = run["status"]
         polling["last_poll_run_finished_at"] = run["finished_at"]
         polling["last_poll_duration_ms"] = duration_ms
+        if self.store:
+            self.store.save_poll_run(run)
         self.persist()
+
+    def recover_interrupted_poll_runs(self) -> int:
+        running_ids = [
+            str(run["id"])
+            for run in self.poll_runs
+            if run.get("id") and run.get("status") == "running"
+        ]
+        if not running_ids:
+            return 0
+        with self.deferred_persistence():
+            for run_id in running_ids:
+                self.finish_poll_run(
+                    run_id,
+                    "failed",
+                    error="poller stopped before this cycle completed",
+                )
+        return len(running_ids)
 
     def request_manual_poll(self, source: str = "manual poll") -> dict[str, Any]:
         polling = self.settings.setdefault("polling", {})
@@ -946,17 +991,23 @@ class NetWatchState:
 
     def update_external_poller_status(self, status: str, pid: int | None = None) -> None:
         polling = self.settings.setdefault("polling", {})
+        last_seen = now_iso()
+        last_seen_ts = time.time()
+        poller_pid = pid if pid is not None else os.getpid()
         polling["external_poller_status"] = status
-        polling["external_poller_last_seen"] = now_iso()
-        polling["external_poller_last_seen_ts"] = time.time()
-        polling["external_poller_pid"] = pid if pid is not None else os.getpid()
+        polling["external_poller_last_seen"] = last_seen
+        polling["external_poller_last_seen_ts"] = last_seen_ts
+        polling["external_poller_pid"] = poller_pid
         if status == "polling":
             polling["backend_status"] = "polling"
         elif status == "running":
             polling["backend_status"] = "running" if polling.get("backend_auto_poll") else "idle"
         elif status == "stopped":
             polling["backend_status"] = "stopped"
-        self.persist()
+        if self.store:
+            self.store.update_poller_runtime(status, last_seen, last_seen_ts, poller_pid)
+        else:
+            self.persist()
 
     def is_external_poller_alive(self, max_age_seconds: int = 45) -> bool:
         polling = self.settings.setdefault("polling", {})
@@ -996,7 +1047,13 @@ class NetWatchState:
             self.smc_sources.append(source)
         self.persist()
 
-    def import_smc_discovery(self, discovery: dict[str, Any], source_key: str) -> dict[str, Any]:
+    def import_smc_discovery(
+        self,
+        discovery: dict[str, Any],
+        source_key: str,
+        record_event: bool = True,
+        record_history: bool = True,
+    ) -> dict[str, Any]:
         self.mode = "live"
         device = deepcopy(discovery["device"])
         device["smc_source_key"] = source_key
@@ -1008,15 +1065,20 @@ class NetWatchState:
         self.devices = list(devices_by_id.values())
         self._deduplicate_observed_topology()
         self._propagate_endpoint_port_traffic()
-        self._record_interface_history(self.devices)
+        if record_history:
+            self._record_interface_history(self.devices)
         self._sync_alerts_from_devices()
         self._annotate_topology_links()
         counts = discovery.get("counts", {})
-        event = self.add_event(
-            "SMC host imported: "
-            f"{device.get('name') or device['id']}, {counts.get('interfaces', 0)} interfaces, "
-            f"{counts.get('hardware_stats', 0)} hardware stats, {counts.get('vfcs', 0)} VFCs"
-        )
+        event = None
+        if record_event:
+            event = self.add_event(
+                "SMC host imported: "
+                f"{device.get('name') or device['id']}, {counts.get('interfaces', 0)} interfaces, "
+                f"{counts.get('hardware_stats', 0)} hardware stats, {counts.get('vfcs', 0)} VFCs"
+            )
+        else:
+            self.persist()
         return {"event": event, "snapshot": self.snapshot()}
 
     def mark_smc_poll_failed(self, source_key: str, reason: str) -> dict[str, Any]:
@@ -1058,7 +1120,12 @@ class NetWatchState:
         event = self.add_event(f"Topology layout saved for {updated} device(s)")
         return {"event": event, "updated": updated, "snapshot": self.snapshot()}
 
-    def import_live_discovery(self, discovery: dict[str, Any], seed_key: str | None = None) -> dict[str, Any]:
+    def import_live_discovery(
+        self,
+        discovery: dict[str, Any],
+        seed_key: str | None = None,
+        record_history: bool = True,
+    ) -> dict[str, Any]:
         self.mode = "live"
         self.live_failures = 0
         device = deepcopy(discovery["device"])
@@ -1137,7 +1204,8 @@ class NetWatchState:
         self._deduplicate_observed_topology()
         self._prune_unlinked_observed_endpoints(seed_key)
         self._propagate_endpoint_port_traffic()
-        self._record_interface_history(self.devices)
+        if record_history:
+            self._record_interface_history(self.devices)
         self._sync_alerts_from_devices()
         self._annotate_topology_links()
         counts = discovery["counts"]
@@ -1148,6 +1216,56 @@ class NetWatchState:
             f"{counts.get('described_endpoints', 0)} described endpoints"
         )
         return {"event": event, "snapshot": self.snapshot()}
+
+    def import_live_metrics(self, metrics: dict[str, Any], seed_key: str) -> dict[str, Any]:
+        device = next((item for item in self.devices if item.get("seed_key") == seed_key), None)
+        if device is None:
+            raise ValueError(f"seed {seed_key} has no imported device inventory")
+
+        interfaces_by_index = {
+            str(interface.get("if_index")): interface
+            for interface in device.get("interfaces", [])
+            if interface.get("if_index") is not None
+        }
+        updated = 0
+        metric_fields = (
+            "admin_status",
+            "oper_status",
+            "in_octets",
+            "out_octets",
+            "in_errors",
+            "out_errors",
+            "in_discards",
+            "out_discards",
+        )
+        for fresh in metrics.get("interfaces", []):
+            interface = interfaces_by_index.get(str(fresh.get("if_index")))
+            if interface is None:
+                continue
+            for field in metric_fields:
+                if field in fresh:
+                    interface[field] = fresh[field]
+            updated += 1
+
+        device["status"] = "up"
+        device["last_seen"] = now_iso()
+        self.live_failures = 0
+        self._calculate_live_rates(device)
+        for seed in self.seeds:
+            if seed.get("key") != seed_key:
+                continue
+            seed["status"] = "up"
+            seed["last_error"] = ""
+            seed["last_counts"] = {**seed.get("last_counts", {}), **metrics.get("counts", {})}
+
+        self._propagate_endpoint_port_traffic()
+        self._sync_alerts_from_devices()
+        self.persist()
+        return {"event": None, "snapshot": self.snapshot(), "updated_interfaces": updated}
+
+    def record_interface_history(self) -> None:
+        self._record_interface_history(self.devices)
+        self.persist()
 
     def mark_live_poll_failed(self, reason: str, seed_key: str | None = None) -> dict[str, Any]:
         self.live_failures += 1
